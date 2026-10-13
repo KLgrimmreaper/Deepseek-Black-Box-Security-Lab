@@ -98,6 +98,14 @@ def render_report(run, plan, results, findings):
         note = ("the summary paragraph above was written by the runner, not by the model. the results, the severities "
                 "and the findings below are recorded from the actual responses.")
     lines += ["", note, "", "every finding points at the evidence file it came from.", ""]
+    lines += [
+        "how to read the result column: failed means the recorded response directly shows the condition the "
+        "check describes, needs_review means the response is only consistent with it and a human has to decide, "
+        "passed means the specific thing was checked and not found (which is not the same as the target being "
+        "clean), not_applicable means the check could not reach a conclusion, and error means the check could "
+        "not run at all.",
+        "",
+    ]
 
     lines += _plan_section(plan)
     lines += [""] + _results_section(results)

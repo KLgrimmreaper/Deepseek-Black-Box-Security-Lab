@@ -1,36 +1,72 @@
 import json
+import ssl
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 ROOT_HTML = "<!doctype html><html><body><h1>fake lab app</h1></body></html>"
 LOGIN_PATH = "/rest/user/login"
 SEARCH_PATH = "/rest/products/search"
 
+CERT_DIR = Path(__file__).parent / "certs"
+CA_FILE = CERT_DIR / "ca.pem"
+SERVER_CERT = CERT_DIR / "server.pem"
+SERVER_KEY = CERT_DIR / "server-key.pem"
+
 SECURITY_HEADERS = {
     "Content-Security-Policy": "default-src 'self'",
     "X-Frame-Options": "DENY",
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
+    "Strict-Transport-Security": "max-age=31536000",
 }
 
-BAD_PAGE_HEADERS = {
-    "Server": "FakeServer/1.0",
-    "X-Powered-By": "FakeStack",
-    # a session cookie with none of the protective attributes
-    "Set-Cookie": "session=abc123; Path=/",
-}
+# what a sloppy app gives away without meaning to
+BAD_PAGE_HEADERS = {"Server": "FakeServer/1.0", "X-Powered-By": "FakeStack"}
 
 
 class FakeTarget:
-    """a tiny http target with a deliberately sloppy and a deliberately hardened mode."""
+    """a tiny http or https target with a deliberately bad mode and a hardened mode.
 
-    def __init__(self, hardened=False):
+    the single behaviour options exist so the behaviour matrix can pin down one check at a
+    time, including the cases that used to be reported as findings when nothing was proven.
+    """
+
+    def __init__(
+        self,
+        hardened=False,
+        tls=False,
+        restricted_paths=False,
+        search_reflects=True,
+        json_reflection=False,
+        page_cookie="session",
+        cors_mode="reflect_credentials",
+        methods="trace_and_advertise",
+        delayed_throttle=False,
+        lockout_after=0,
+    ):
         self.hardened = hardened
+        self.tls = tls
+        self.restricted_paths = restricted_paths
+        self.search_reflects = search_reflects
+        self.json_reflection = json_reflection
+        self.page_cookie = page_cookie
+        self.cors_mode = cors_mode
+        self.methods = methods
+        self.delayed_throttle = delayed_throttle
+        self.lockout_after = lockout_after
         self.valid_logins = {("admin@example.com", "fakepass1")}
         self.login_attempts = 0
+
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._build_handler())
-        self.origin = f"http://127.0.0.1:{self.server.server_address[1]}"
+        if tls:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(SERVER_CERT, SERVER_KEY)
+            self.server.socket = context.wrap_socket(self.server.socket, server_side=True)
+        scheme = "https" if tls else "http"
+        self.origin = f"{scheme}://127.0.0.1:{self.server.server_address[1]}"
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
 
@@ -66,14 +102,27 @@ class FakeTarget:
                     self.wfile.write(payload)
 
             def _page_headers(self, cors=False):
-                headers = dict(SECURITY_HEADERS) if target.hardened else dict(BAD_PAGE_HEADERS)
                 if target.hardened:
+                    headers = dict(SECURITY_HEADERS)
                     headers["Set-Cookie"] = "session=fake; Path=/; Secure; HttpOnly; SameSite=Strict"
-                elif cors:
+                    return headers
+
+                headers = dict(BAD_PAGE_HEADERS)
+                if target.page_cookie == "session":
+                    headers["Set-Cookie"] = "session=abc123; Path=/"
+                elif target.page_cookie == "consent":
+                    # a preference cookie, not a session cookie, so it is only an observation
+                    headers["Set-Cookie"] = "cookieconsent_status=1; Path=/"
+
+                if cors:
                     origin = self.headers.get("Origin")
-                    if origin:
+                    if target.cors_mode == "reflect_credentials" and origin:
                         headers["Access-Control-Allow-Origin"] = origin
                         headers["Access-Control-Allow-Credentials"] = "true"
+                    elif target.cors_mode == "reflect_only" and origin:
+                        headers["Access-Control-Allow-Origin"] = origin
+                    elif target.cors_mode == "wildcard":
+                        headers["Access-Control-Allow-Origin"] = "*"
                 return headers
 
             def _read_body(self):
@@ -105,11 +154,16 @@ class FakeTarget:
                 if route == "/.env":
                     if target.hardened:
                         return self._send(404, "not found", "text/plain")
+                    if target.restricted_paths:
+                        # exists, but the server refuses it, which is the correct behaviour
+                        return self._send(403, "forbidden", "text/plain")
                     return self._send(200, "DB_PASSWORD=fake\n", "text/plain")
 
                 if route == "/metrics":
                     if target.hardened:
                         return self._send(404, "not found", "text/plain")
+                    if target.restricted_paths:
+                        return self._send(403, "forbidden", "text/plain")
                     return self._send(200, "# metrics\nfake_requests_total 42\n", "text/plain")
 
                 if route == "/admin":
@@ -119,6 +173,11 @@ class FakeTarget:
 
                 if route == SEARCH_PATH:
                     value = query.get("q", [""])[0]
+                    if not target.search_reflects:
+                        return self._send(200, "<html><body>no results</body></html>")
+                    if target.json_reflection:
+                        # the payload comes back untouched, but as json, so a browser never runs it
+                        return self._send(200, json.dumps({"query": value, "results": []}), "application/json")
                     if target.hardened:
                         value = value.replace("<", "&lt;").replace(">", "&gt;")
                     return self._send(200, f"<html><body>results for {value}</body></html>")
@@ -136,11 +195,18 @@ class FakeTarget:
                 return self._send(404, "not found", "text/plain")
 
             def do_OPTIONS(self):
-                allow = "GET, HEAD" if target.hardened else "GET, POST, PUT, DELETE, TRACE"
+                if target.hardened or target.methods == "clean":
+                    allow = "GET, HEAD"
+                elif target.methods == "advertise_only":
+                    allow = "GET, POST, PUT, DELETE"
+                elif target.methods == "no_allow":
+                    return self._send(200, "")
+                else:
+                    allow = "GET, POST, PUT, DELETE, TRACE"
                 return self._send(200, "", extra_headers={"Allow": allow})
 
             def do_TRACE(self):
-                if target.hardened:
+                if target.hardened or target.methods != "trace_and_advertise":
                     return self._send(405, "method not allowed", "text/plain")
                 return self._send(200, "TRACE / HTTP/1.1\r\nHost: fake\r\n", "text/plain")
 
@@ -163,6 +229,14 @@ class FakeTarget:
                     if target.login_attempts > 3:
                         return self._send(429, "too many requests", "text/plain")
                     return self._send(401, json.dumps({"error": "invalid credentials"}), "application/json")
+
+                if target.delayed_throttle and target.login_attempts > 3:
+                    # no 429, just a slower answer once the attempts pile up
+                    time.sleep(0.4)
+                    return self._send(401, json.dumps({"error": "invalid credentials"}), "application/json")
+
+                if target.lockout_after and target.login_attempts > target.lockout_after:
+                    return self._send(403, json.dumps({"error": "account locked"}), "application/json")
 
                 if "' OR 1=1" in email or (email, password) in target.valid_logins:
                     return self._send(

@@ -6,10 +6,23 @@ from urllib.parse import quote
 from .scope import body_snippet, lower_headers
 
 # every check returns a dict with:
-#   result: passed | failed | error | not_applicable
+#   result: failed | needs_review | passed | not_applicable | error
 #   detail: one line for the results table
 #   evidence: what gets written to evidence/<run_id>/<check_id>.json
-# a check never decides its own severity or whether it becomes a finding, the runner does that.
+#
+# the result is a claim about the evidence, so each value has an evidence requirement:
+#
+#   failed          the recorded response directly demonstrates the condition the check describes
+#                   (a header really is absent, a payload really was accepted, a file really was served)
+#   needs_review    the response is consistent with the condition but does not demonstrate it
+#                   (a 403 instead of a 200, no 429 seen, a wildcard header, a non html reflection,
+#                   a non session cookie, a method only advertised). a human decides if it counts
+#   passed          the specific thing was checked and not found. it never means the target is clean
+#   not_applicable  the check could not reach a conclusion at all (nothing reflected, no cookie set)
+#   error           the check could not run (tls failure, timeout, budget reached, endpoint missing)
+#
+# failed and needs_review both produce a finding, with status confirmed and needs_review respectively.
+# a check never decides its own severity and never writes a finding, the runner does that.
 
 SENSITIVE_PATHS = [
     "/.env",
@@ -46,6 +59,9 @@ XSS_PAYLOAD = f"{MARKER}<script>alert(1)</script>"
 SQLI_EMAIL = "' OR 1=1--"
 REDIRECT_TARGET = "https://evil.example/dsh-lab"
 REDIRECT_PARAMS = ["/?to=", "/?next=", "/redirect?url="]
+
+# a cookie whose name suggests a session is judged as one, other cookies are only observations
+SESSION_COOKIE_HINTS = ("session", "sess", "sid", "token", "auth", "jwt", "remember", "login")
 
 
 def http_evidence(response, limit=2000):
@@ -150,6 +166,7 @@ def check_cookie_flags(scope, cfg):
             "evidence": evidence,
         }
     problems = []
+    observations = []
     for item in cookies:
         parts = [part.strip() for part in item["cookie"].split(";")]
         name = parts[0].split("=")[0].strip()
@@ -161,12 +178,26 @@ def check_cookie_flags(scope, cfg):
             issues.append("no httponly")
         if not any(attribute.startswith("samesite") for attribute in attributes):
             issues.append("no samesite")
-        if issues:
+        if not issues:
+            continue
+        lowered = name.lower()
+        if any(hint in lowered for hint in SESSION_COOKIE_HINTS):
             problems.append(f"{name}: " + ", ".join(issues))
-    evidence["problems"] = problems
-    if not problems:
-        return {"result": "passed", "detail": f"secure flags present on {len(cookies)} cookie(s)", "evidence": evidence}
-    return {"result": "failed", "detail": "; ".join(problems), "evidence": evidence}
+        else:
+            # a preference or consent cookie missing httponly is not a session handling problem
+            observations.append(f"{name}: " + ", ".join(issues))
+    evidence["session_cookie_problems"] = problems
+    evidence["other_cookie_observations"] = observations
+    if problems:
+        return {"result": "failed", "detail": "; ".join(problems), "evidence": evidence}
+    if observations:
+        return {
+            "result": "needs_review",
+            "detail": "no session cookie was set, but non session cookie(s) lack protective flags: "
+                      + "; ".join(observations),
+            "evidence": evidence,
+        }
+    return {"result": "passed", "detail": f"secure flags present on {len(cookies)} cookie(s)", "evidence": evidence}
 
 
 def check_cors_policy(scope, cfg):
@@ -180,19 +211,28 @@ def check_cors_policy(scope, cfg):
     evidence["access_control_allow_credentials"] = allow_credentials
     reflected = allow_origin == "https://evil.example"
     wildcard = allow_origin == "*"
-    if reflected and allow_credentials.lower() == "true":
-        detail = "the sent origin is reflected and allow-credentials is true, any site can read authenticated responses"
-        return {"result": "failed", "detail": detail, "evidence": evidence}
-    if reflected:
+    credentials = allow_credentials.lower() == "true"
+    if reflected and credentials:
+        # the header pair is what a browser acts on, so this is demonstrated rather than suspected
         return {
             "result": "failed",
-            "detail": "the sent origin https://evil.example is reflected in access-control-allow-origin",
+            "detail": "the sent origin is reflected and allow-credentials is true, so a browser would let "
+                      "https://evil.example read credentialed responses from this endpoint",
+            "evidence": evidence,
+        }
+    if reflected:
+        return {
+            "result": "needs_review",
+            "detail": "the sent origin https://evil.example is reflected, but allow-credentials is not true, so a "
+                      "browser would only let it read responses that need no credentials",
             "evidence": evidence,
         }
     if wildcard:
         return {
-            "result": "failed",
-            "detail": "access-control-allow-origin is *, any site can read the response",
+            "result": "needs_review",
+            "detail": "access-control-allow-origin is *, which lets any site read responses that need no "
+                      "credentials. this run only asked for the main page, so whether anything sensitive is "
+                      "readable was not established",
             "evidence": evidence,
         }
     if not allow_origin:
@@ -215,11 +255,19 @@ def check_http_methods(scope, cfg):
     }
     detail = []
     if trace_allowed:
-        detail.append("trace answered with 200")
-    if risky:
-        detail.append("options allows: " + ", ".join(risky))
-    if detail:
+        # trace answering is demonstrated by the response, so this part is a finding
+        detail.append("trace answered with 200, which echoes the request back")
+        advertised = [method for method in risky if method != "TRACE"]
+        if advertised:
+            detail.append("options also advertises: " + ", ".join(advertised))
         return {"result": "failed", "detail": "; ".join(detail), "evidence": evidence}
+    if risky:
+        return {
+            "result": "needs_review",
+            "detail": "options advertises " + ", ".join(risky) + f" but the trace probe returned "
+                      f"{trace_response.status_code}, so nothing was demonstrated to be enabled",
+            "evidence": evidence,
+        }
     if not allow:
         return {"result": "not_applicable", "detail": "no allow header in the options response", "evidence": evidence}
     return {"result": "passed", "detail": f"only {allow} allowed", "evidence": evidence}
@@ -254,13 +302,16 @@ def check_sensitive_paths(scope, cfg):
     base = scope.get("/")
     base_hash = sha256(base.content[:2000]).hexdigest()
     probes = []
-    reachable = []
+    served = []
+    restricted = []
     for path in SENSITIVE_PATHS:
         response = scope.get(path)
         probe = {"path": path, "status": response.status_code, "bytes": len(response.content)}
         if response.status_code in (401, 403):
-            probe["note"] = "answers, but restricted"
-            reachable.append(dict(probe))
+            # the path exists but the server refused it. that is the correct behaviour and
+            # nothing was disclosed, so it is an observation and not an exposure
+            probe["note"] = "access refused, nothing was disclosed"
+            restricted.append(dict(probe))
         elif response.status_code == 200:
             if sha256(response.content[:2000]).hexdigest() == base_hash:
                 # a single page app answers 200 with the app shell for unknown paths,
@@ -269,13 +320,29 @@ def check_sensitive_paths(scope, cfg):
             else:
                 probe["note"] = "served"
                 probe["body"] = body_snippet(response, 300)
-                reachable.append(dict(probe))
+                served.append(dict(probe))
         probes.append(probe)
-    evidence = {"base_status": base.status_code, "probes": probes, "reachable": reachable}
-    if not reachable:
-        return {"result": "passed", "detail": "none of the 16 probed paths was reachable", "evidence": evidence}
-    paths = ", ".join(f"{item['path']} ({item['status']})" for item in reachable)
-    return {"result": "failed", "detail": f"reachable: {paths}", "evidence": evidence}
+    evidence = {
+        "base_status": base.status_code,
+        "probes": probes,
+        "served_without_authentication": served,
+        "answered_but_refused": restricted,
+    }
+    if served:
+        paths = ", ".join(f"{item['path']} ({item['status']})" for item in served)
+        return {
+            "result": "failed",
+            "detail": f"content served to an unauthenticated request: {paths}",
+            "evidence": evidence,
+        }
+    if restricted:
+        paths = ", ".join(f"{item['path']} ({item['status']})" for item in restricted)
+        return {
+            "result": "needs_review",
+            "detail": f"{len(restricted)} path(s) exist but refused access, so nothing leaked: {paths}",
+            "evidence": evidence,
+        }
+    return {"result": "passed", "detail": "none of the 16 probed paths returned content", "evidence": evidence}
 
 
 def check_error_disclosure(scope, cfg):
@@ -344,16 +411,27 @@ def check_reflected_xss(scope, cfg):
     separator = "&q=" if "?" in path else "?q="
     response = scope.get(f"{path}{separator}{quote(XSS_PAYLOAD, safe='')}")
     body = response.text
+    content_type = response.headers.get("Content-Type", "")
+    is_html = "html" in content_type.lower()
     evidence = {
         "payload": XSS_PAYLOAD,
         "response": http_evidence(response),
+        "content_type": content_type,
+        "html_response": is_html,
         "raw_payload_in_body": XSS_PAYLOAD in body,
         "marker_in_body": MARKER in body,
     }
-    if XSS_PAYLOAD in body:
+    if XSS_PAYLOAD in body and is_html:
         return {
             "result": "failed",
-            "detail": "the script tag came back unencoded in the response body",
+            "detail": "the script tag came back unencoded in an html response",
+            "evidence": evidence,
+        }
+    if XSS_PAYLOAD in body:
+        return {
+            "result": "needs_review",
+            "detail": f"the payload came back unencoded, but the response is {content_type or 'not html'}, which a "
+                      "browser does not execute as html. this is an encoding problem, not proven xss",
             "evidence": evidence,
         }
     if MARKER in body or "&lt;script&gt;" in body:
@@ -415,25 +493,56 @@ def check_weak_credentials(scope, cfg):
     return {"result": "passed", "detail": f"none of the {len(attempts)} demo passwords worked", "evidence": evidence}
 
 
+def _median(values):
+    ordered = sorted(values)
+    return ordered[len(ordered) // 2]
+
+
 def check_rate_limit(scope, cfg):
     attempts = min(cfg["rate_limit_attempts"], 10)
     email = f"nobody{secrets.token_hex(3)}@example.com"
-    statuses = []
+    attempt_log = []
     for _ in range(attempts):
         response = scope.post(cfg["login_path"], json={"email": email, "password": "not-the-password"})
-        statuses.append(response.status_code)
-    evidence = {"attempts": attempts, "statuses": statuses}
-    if any(status in (429, 503) for status in statuses):
-        first_throttled = next(index for index, status in enumerate(statuses) if status in (429, 503)) + 1
+        attempt_log.append({"status": response.status_code, "ms": scope.last_elapsed_ms})
+
+    statuses = [item["status"] for item in attempt_log]
+    evidence = {"attempts": attempts, "attempt_log": attempt_log}
+
+    throttled = [item for item in attempt_log if item["status"] in (429, 503)]
+    if throttled:
+        first = attempt_log.index(throttled[0]) + 1
         return {
             "result": "passed",
-            "detail": f"throttling appeared on attempt {first_throttled} of {attempts}",
+            "detail": f"throttling appeared on attempt {first} of {attempts} with status {throttled[0]['status']}",
             "evidence": evidence,
         }
+
+    if len(set(statuses)) > 1 and statuses[0] in (401, 403):
+        changed = next(item for item in attempt_log if item["status"] != statuses[0])
+        return {
+            "result": "needs_review",
+            "detail": f"the login status changed from {statuses[0]} to {changed['status']} during the run, "
+                      "which may be an account lockout rather than a throttle",
+            "evidence": evidence,
+        }
+
+    window = max(1, attempts // 3)
+    early = _median([item["ms"] for item in attempt_log[:window]])
+    late = _median([item["ms"] for item in attempt_log[-window:]])
+    if late > max(3 * early, 250):
+        return {
+            "result": "needs_review",
+            "detail": f"responses slowed from about {early}ms to about {late}ms over {attempts} attempts, "
+                      "which may be delay based throttling",
+            "evidence": evidence,
+        }
+
     if any(status in (401, 403, 200) for status in statuses):
         return {
-            "result": "failed",
-            "detail": f"{attempts} quick login attempts, none of them answered 429 or 503",
+            "result": "needs_review",
+            "detail": f"{attempts} quick login attempts all got {statuses[0]}, with no 429, no slowdown and no "
+                      "lockout. this does not show that throttling is absent, only that it did not trigger here",
             "evidence": evidence,
         }
     return {

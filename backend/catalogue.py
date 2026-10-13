@@ -4,6 +4,10 @@
 #
 # severity is a fixed property of the check, so the model cannot talk a finding up or down.
 # fix is the fallback text used when the model does not write a remediation.
+#
+# a check returns failed when the response directly demonstrates the condition it describes,
+# and needs_review when the response is only consistent with it. the descriptions below say
+# which of the two each check can produce, so the difference is visible before a run starts.
 
 CATALOGUE = [
     {
@@ -28,7 +32,8 @@ CATALOGUE = [
         "name": "session cookie without secure flags",
         "category": "session handling",
         "severity": "medium",
-        "description": "checks the main page and the login endpoint for set-cookie headers missing secure, httponly or samesite",
+        "description": "checks the main page and the login endpoint for set-cookie headers missing secure, httponly or "
+                       "samesite. a cookie whose name does not look session like is only an observation",
         "fix": "set secure, httponly and samesite on every session cookie",
     },
     {
@@ -36,8 +41,9 @@ CATALOGUE = [
         "name": "permissive cors policy",
         "category": "misconfiguration",
         "severity": "medium",
-        "description": "sends origin: https://evil.example and checks whether the origin is reflected back, "
-                       "especially together with allow-credentials",
+        "description": "sends origin: https://evil.example and checks whether the origin is reflected back. a reflected "
+                       "origin together with allow-credentials is a finding, a wildcard or a reflection without "
+                       "credentials is an observation because nothing sensitive was shown to be readable",
         "fix": "return access-control-allow-origin only for origins you actually trust, never reflect the request origin "
                "while also sending allow-credentials",
     },
@@ -46,7 +52,8 @@ CATALOGUE = [
         "name": "risky http methods enabled",
         "category": "misconfiguration",
         "severity": "low",
-        "description": "sends options and trace to the main page and reports trace, put, delete or patch when they are allowed",
+        "description": "sends options and trace to the main page. trace answering with 200 is a finding, a risky method "
+                       "that is only listed in the allow header is an observation",
         "fix": "disable trace at the server and restrict put, delete and patch to the routes that need them",
     },
     {
@@ -63,8 +70,9 @@ CATALOGUE = [
         "name": "sensitive path reachable",
         "category": "exposure",
         "severity": "medium",
-        "description": "requests a fixed 16 line list of paths such as /.env, /.git/HEAD, /ftp, /metrics and /server-status "
-                       "and reports the ones that answer with 200, 401 or 403",
+        "description": "requests a fixed 16 line list of paths such as /.env, /.git/HEAD, /ftp, /metrics and /server-status. "
+                       "only content served to an unauthenticated request is a finding, a 401 or 403 means the server "
+                       "refused it and is recorded without being called an exposure",
         "fix": "remove the file or route from the deployment, or block it at the proxy",
     },
     {
@@ -90,7 +98,8 @@ CATALOGUE = [
         "category": "injection",
         "severity": "high",
         "description": "sends a harmless marker plus a script tag to the search parameter and checks whether the tags "
-                       "come back unencoded in the response body",
+                       "come back unencoded in an html response. reflection in a json response is recorded as an "
+                       "encoding problem, because a browser does not run it",
         "fix": "encode output, or render the parameter as text instead of html",
     },
     {
@@ -115,7 +124,9 @@ CATALOGUE = [
         "name": "no throttling on login attempts",
         "category": "authentication",
         "severity": "low",
-        "description": "sends 10 quick failed logins and reports whether any request was answered with 429 or 503",
+        "description": "sends 10 quick failed logins and reports throttling when it shows up as a 429, a lockout or "
+                       "clearly slower answers. ten requests cannot show that throttling is absent, so a quiet run "
+                       "is only an observation",
         "fix": "add rate limiting and account lockout on the login endpoint",
     },
 ]

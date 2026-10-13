@@ -17,9 +17,16 @@ def make_config(target, tmp_path, **overrides):
         "evidence_dir": tmp_path / "evidence",
         "reports_dir": tmp_path / "reports",
         "credentials": ["admin@example.com:fakepass1", "nobody@example.com:wrong-password"],
+        "ca_bundle": "",
     }
     settings.update(overrides)
     return load_config(settings)
+
+
+def run_checks(target, cfg, only=None):
+    run_id = run_pipeline(target.origin, "test run", cfg, only_checks=only or catalogue_ids())
+    results = {row["check_id"]: row for row in db.get_check_results(cfg["db_path"], run_id)}
+    return run_id, results
 
 
 def test_every_catalogue_entry_has_a_check_function():
@@ -27,73 +34,65 @@ def test_every_catalogue_entry_has_a_check_function():
     assert sorted(catalogue_ids()) == sorted(CHECKS.keys())
 
 
-def test_sloppy_target_fails_the_expected_checks(tmp_path):
+def test_the_vocabulary_is_the_one_the_runner_understands():
+    # the runner only turns these two into findings, everything else is not a claim about the target
+    from backend.runner import FINDING_RESULTS
+
+    assert FINDING_RESULTS == ("failed", "needs_review")
+
+
+def test_a_sloppy_target_gives_twelve_failures_and_one_observation(tmp_path):
     target = FakeTarget(hardened=False)
     try:
         cfg = make_config(target.origin, tmp_path)
-        run_id = run_pipeline(target.origin, "test run", cfg, only_checks=catalogue_ids())
-        results = {row["check_id"]: row for row in db.get_check_results(cfg["db_path"], run_id)}
+        run_id, results = run_checks(target, cfg)
 
-        failed = {check_id for check_id, row in results.items() if row["result"] == "failed"}
-        assert failed == {
-            "security_headers",
-            "server_info_disclosure",
-            "cookie_flags",
-            "cors_policy",
-            "http_methods",
-            "robots_disclosure",
-            "sensitive_paths",
-            "error_disclosure",
-            "sql_injection_login",
-            "reflected_xss",
-            "open_redirect",
-            "weak_credentials",
-            "rate_limit",
-        }
+        counts = {}
+        for row in results.values():
+            counts[row["result"]] = counts.get(row["result"], 0) + 1
+
+        # everything except rate limiting is demonstrated by a response, and rate limiting
+        # cannot be demonstrated to be absent by ten requests, so it stays an observation
+        assert counts == {"failed": 12, "needs_review": 1}
+        assert results["rate_limit"]["result"] == "needs_review"
+
+        findings = db.get_findings(cfg["db_path"], run_id)
+        assert len(findings) == 13
+        assert sum(1 for finding in findings if finding["status"] == "confirmed") == 12
+        assert sum(1 for finding in findings if finding["status"] == "needs_review") == 1
         assert db.get_run(cfg["db_path"], run_id)["status"] == "finished"
     finally:
         target.stop()
 
 
-def test_hardened_target_passes_the_expected_checks(tmp_path):
+def test_a_hardened_target_reports_no_findings(tmp_path):
     target = FakeTarget(hardened=True)
     try:
         cfg = make_config(target.origin, tmp_path)
-        run_id = run_pipeline(target.origin, "hardened run", cfg, only_checks=catalogue_ids())
-        results = {row["check_id"]: row for row in db.get_check_results(cfg["db_path"], run_id)}
+        run_id, results = run_checks(target, cfg)
 
-        for check_id in [
-            "security_headers",
-            "server_info_disclosure",
-            "cookie_flags",
-            "cors_policy",
-            "http_methods",
-            "sensitive_paths",
-            "error_disclosure",
-            "sql_injection_login",
-            "reflected_xss",
-            "open_redirect",
-            "weak_credentials",
-            "rate_limit",
-        ]:
-            assert results[check_id]["result"] == "passed", f"{check_id}: {results[check_id]['detail']}"
+        counts = {}
+        for row in results.values():
+            counts[row["result"]] = counts.get(row["result"], 0) + 1
+
+        assert counts == {"passed": 12, "not_applicable": 1}
+        assert results["robots_disclosure"]["result"] == "not_applicable"
         assert db.get_findings(cfg["db_path"], run_id) == []
     finally:
         target.stop()
 
 
 def test_spa_fallback_is_not_reported_as_an_exposed_path(tmp_path):
-    target = FakeTarget(hardened=False)
+    target = FakeTarget(hardened=True)
     try:
         cfg = make_config(target.origin, tmp_path)
-        run_id = run_pipeline(target.origin, "", cfg, only_checks=["sensitive_paths"])
-        row = db.get_check_results(cfg["db_path"], run_id)[0]
+        run_id, results = run_checks(target, cfg, only=["sensitive_paths"])
         evidence = (tmp_path / "evidence" / str(run_id) / "sensitive_paths.json").read_text(encoding="utf-8")
 
-        assert row["result"] == "failed"
+        # /admin answers 200 with the app shell in both modes, and must not be reported
+        assert results["sensitive_paths"]["result"] == "passed"
         assert "/admin" in evidence
         assert "client side route" in evidence
-        assert '"path": "/.env"' in evidence
     finally:
         target.stop()
 
@@ -106,11 +105,10 @@ def test_failed_check_without_evidence_is_recorded_as_error(tmp_path, monkeypatc
         cfg = make_config(target.origin, tmp_path)
         # a failed check whose evidence cannot be written must not become a finding
         monkeypatch.setattr(runner, "_write_evidence", lambda *args, **kwargs: None)
-        run_id = run_pipeline(target.origin, "", cfg, only_checks=["security_headers"])
+        run_id, results = run_checks(target, cfg, only=["security_headers"])
 
-        results = db.get_check_results(cfg["db_path"], run_id)
-        assert results[0]["result"] == "error"
-        assert "evidence file could not be written" in results[0]["detail"]
+        assert results["security_headers"]["result"] == "error"
+        assert "evidence file could not be written" in results["security_headers"]["detail"]
         assert db.get_findings(cfg["db_path"], run_id) == []
     finally:
         target.stop()
@@ -120,7 +118,7 @@ def test_findings_point_at_evidence_that_exists(tmp_path):
     target = FakeTarget(hardened=False)
     try:
         cfg = make_config(target.origin, tmp_path)
-        run_id = run_pipeline(target.origin, "", cfg, only_checks=["security_headers", "sql_injection_login"])
+        run_id, _ = run_checks(target, cfg, only=["security_headers", "sql_injection_login"])
         findings = db.get_findings(cfg["db_path"], run_id)
 
         assert findings
@@ -138,7 +136,7 @@ def test_report_is_written_and_separates_model_text_from_results(tmp_path):
     target = FakeTarget(hardened=False)
     try:
         cfg = make_config(target.origin, tmp_path)
-        run_id = run_pipeline(target.origin, "report check", cfg, only_checks=["security_headers"])
+        run_id, _ = run_checks(target, cfg, only=["security_headers"])
         text = (tmp_path / "reports" / f"run_{run_id}.md").read_text(encoding="utf-8")
 
         assert f"# black-box test report, run {run_id}" in text

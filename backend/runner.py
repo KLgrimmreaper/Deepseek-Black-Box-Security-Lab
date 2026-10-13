@@ -2,13 +2,17 @@ import json
 import traceback
 from pathlib import Path
 
+import requests
+
 from . import agent, checks, db, report
 from .catalogue import CATALOGUE_BY_ID
 from .config import BASE_DIR
 from .scope import Scope, ScopeError, body_snippet
 
-# checks where a failed result is worth showing but a human should decide if it counts
-SOFT_CHECKS = {"server_info_disclosure", "robots_disclosure", "rate_limit", "http_methods"}
+# the two results that produce a finding. failed means the check demonstrated the condition,
+# needs_review means it only observed something consistent with it, and the finding keeps that
+# distinction so the report never presents a suspicion as a confirmed vulnerability.
+FINDING_RESULTS = ("failed", "needs_review")
 
 
 def collect_recon(scope):
@@ -69,8 +73,21 @@ def _run_checks(run_id, target, cfg, only_checks, on_progress=None):
         max_requests=cfg["max_requests_per_run"],
         delay_ms=cfg["request_delay_ms"],
         timeout=cfg["request_timeout"],
+        ca_bundle=cfg["ca_bundle"],
     )
-    recon = collect_recon(scope)
+    try:
+        recon = collect_recon(scope)
+    except requests.exceptions.SSLError as exc:
+        # a certificate problem is a connection problem, not a weakness in the target
+        raise ScopeError(f"TLS certificate verification failed for {scope.origin}: {exc}") from exc
+    except requests.exceptions.ConnectionError as exc:
+        # ConnectTimeout subclasses both ConnectionError and Timeout, so this has to come first
+        # or a refused or unreachable host gets reported as a slow one
+        raise ScopeError(f"could not connect to {scope.origin}: {exc}") from exc
+    except requests.exceptions.Timeout as exc:
+        raise ScopeError(
+            f"{scope.origin} did not answer within {cfg['request_timeout']}s, so the run was stopped: {exc}"
+        ) from exc
 
     if only_checks:
         plan = agent.manual_plan(only_checks, cfg)
@@ -95,6 +112,25 @@ def _run_checks(run_id, target, cfg, only_checks, on_progress=None):
             outcome = checks.CHECKS[item["id"]](scope, cfg)
         except ScopeError as exc:
             outcome = {"result": "error", "detail": str(exc), "evidence": {"note": "the check did not complete"}}
+        except requests.exceptions.SSLError as exc:
+            outcome = {
+                "result": "error",
+                "detail": f"TLS certificate verification failed, so this check could not run: {exc}",
+                "evidence": {"note": "the request was refused by the local tls trust settings"},
+            }
+        except requests.exceptions.ConnectionError as exc:
+            outcome = {
+                "result": "error",
+                "detail": f"the connection failed, so this check could not run: {exc}",
+                "evidence": {"note": "the target could not be reached"},
+            }
+        except requests.exceptions.Timeout as exc:
+            # after ConnectionError, because ConnectTimeout is both
+            outcome = {
+                "result": "error",
+                "detail": f"the request timed out after {cfg['request_timeout']}s, so this check could not run: {exc}",
+                "evidence": {"note": "the target did not answer in time"},
+            }
         except Exception as exc:
             # one broken check should not throw away the results of the others
             outcome = {
@@ -108,7 +144,7 @@ def _run_checks(run_id, target, cfg, only_checks, on_progress=None):
         evidence_path = _write_evidence(evidence_dir, item["id"], payload)
         result = outcome["result"]
         detail = outcome["detail"]
-        if result == "failed" and evidence_path is None:
+        if result in FINDING_RESULTS and evidence_path is None:
             # no evidence on disk means no finding, the run can only record that it failed to record
             result = "error"
             detail = f"{detail} (the evidence file could not be written, so no finding was created)"
@@ -124,11 +160,12 @@ def _run_checks(run_id, target, cfg, only_checks, on_progress=None):
             evidence_path=evidence_path,
             requests_used=requests_used,
         )
-        if result == "failed":
+        if result in FINDING_RESULTS:
             candidates.append(
                 {
                     "check_id": item["id"],
                     "entry": entry,
+                    "result": result,
                     "detail": detail,
                     "evidence_path": evidence_path,
                     "excerpt": _evidence_excerpt(outcome["evidence"]),
@@ -164,7 +201,8 @@ def _run_checks(run_id, target, cfg, only_checks, on_progress=None):
             check_id=item["check_id"],
             title=entry["name"],
             severity=entry["severity"],
-            status="needs_review" if item["check_id"] in SOFT_CHECKS else "confirmed",
+            # the check already said how strong its own evidence was, so that carries into the finding
+            status="confirmed" if item["result"] == "failed" else "needs_review",
             evidence_path=item["evidence_path"],
             description=f"{item['detail']}. this was recorded by the runner from the responses above, not by the model.",
             impact=impact,
