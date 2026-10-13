@@ -71,13 +71,12 @@ def _write_evidence(evidence_dir, check_id, payload):
 
 def _run_checks(run_id, target, cfg, only_checks, on_progress=None):
     def stage(message):
-        # the stage is stored so the dashboard can show it, and handed to the cli so a
-        # terminal run is not silent for two minutes
-        db.set_run_stage(cfg["db_path"], run_id, message)
+        # the stage and the live request count are stored so the dashboard can show progress,
+        # and the message is handed to the cli so a terminal run is not silent
+        db.set_run_stage(cfg["db_path"], run_id, message, scope.requests_sent)
         if on_progress:
             on_progress(message)
 
-    stage("checking the target")
     scope = Scope(
         target,
         cfg["allowed_targets"],
@@ -86,6 +85,7 @@ def _run_checks(run_id, target, cfg, only_checks, on_progress=None):
         timeout=cfg["request_timeout"],
         ca_bundle=cfg["ca_bundle"],
     )
+    stage("checking the target")
     try:
         recon = collect_recon(scope, cfg)
     except requests.exceptions.SSLError as exc:

@@ -19,16 +19,21 @@ const TITLES: Record<ViewId, string> = {
   settings: "Settings",
 };
 
-function viewFromHash(): ViewId {
-  const name = window.location.hash.replace("#", "");
-  return name in TITLES ? (name as ViewId) : "overview";
+function stateFromHash(): { view: ViewId; runId: number | null } {
+  const raw = window.location.hash.replace("#", "");
+  const [name, id] = raw.split("/");
+  return {
+    view: name in TITLES ? (name as ViewId) : "overview",
+    runId: id && /^\d+$/.test(id) ? Number(id) : null,
+  };
 }
 
 export default function App() {
-  const [view, setView] = useState<ViewId>(viewFromHash);
+  const initial = stateFromHash();
+  const [view, setView] = useState<ViewId>(initial.view);
   const [health, setHealth] = useState<Health | null>(null);
   const [runs, setRuns] = useState<Run[]>([]);
-  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [selectedId, setSelectedId] = useState<number | null>(initial.runId);
   const [detail, setDetail] = useState<RunDetailData | null>(null);
   const [error, setError] = useState("");
 
@@ -38,8 +43,19 @@ export default function App() {
     setView(next);
   }
 
+  function selectRun(runId: number) {
+    // a single run is linkable too, which makes one worth sharing or screenshotting
+    window.location.hash = `runs/${runId}`;
+    setView("runs");
+    setSelectedId(runId);
+  }
+
   useEffect(() => {
-    const sync = () => setView(viewFromHash());
+    const sync = () => {
+      const next = stateFromHash();
+      setView(next.view);
+      setSelectedId(next.runId);
+    };
     window.addEventListener("hashchange", sync);
     return () => window.removeEventListener("hashchange", sync);
   }, []);
@@ -113,7 +129,7 @@ export default function App() {
               runs={runs}
               detail={detail}
               selectedId={selectedId}
-              onSelect={setSelectedId}
+              onSelect={selectRun}
             />
           )}
           {view === "catalogue" && <Catalogue />}

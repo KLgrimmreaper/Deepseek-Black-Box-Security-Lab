@@ -1,10 +1,81 @@
 import { useEffect, useState } from "react";
 import { getReport } from "../api";
-import type { RunDetail as RunDetailData } from "../types";
+import type { ObservedFacts, RunDetail as RunDetailData } from "../types";
 import FindingCard from "./FindingCard";
 
 const TABS = ["results", "plan", "findings", "report"] as const;
 type Tab = (typeof TABS)[number];
+
+function parseFacts(json: string | undefined): ObservedFacts | null {
+  if (!json) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(json);
+    if (!parsed || typeof parsed !== "object" || Object.keys(parsed).length === 0) {
+      return null;
+    }
+    return parsed as ObservedFacts;
+  } catch {
+    return null;
+  }
+}
+
+function FactsCard({ facts }: { facts: ObservedFacts }) {
+  const form = facts.login_form;
+  const search = facts.search_endpoint;
+  const untrusted = facts.untrusted ?? {};
+  const rows: [string, string][] = [];
+  if (facts.application_shape) {
+    rows.push(["application shape", facts.application_shape]);
+  }
+  if (facts.login_shape) {
+    rows.push(["login shape", facts.login_shape]);
+  }
+  rows.push([
+    "login form",
+    form && form.fields?.length
+      ? `${form.action || "(no action)"} posting ${form.fields.join(", ")}${form.same_origin === false ? " (off host, not used)" : ""}`
+      : "none found",
+  ]);
+  if (search?.path) {
+    rows.push(["search endpoint", `${search.path} answered ${search.status}`]);
+  }
+  if (facts.unknown_path_status !== undefined) {
+    rows.push([
+      "unknown paths",
+      facts.unknown_path_returns_app_shell ? "return the app page" : `answer ${facts.unknown_path_status}`,
+    ]);
+  }
+  if (facts.root_status !== undefined) {
+    rows.push(["root", `${facts.root_status} ${facts.root_content_type ?? ""}`.trim()]);
+  }
+  if (untrusted.title) {
+    rows.push(["untrusted title (from the target)", untrusted.title]);
+  }
+
+  return (
+    <section className="card">
+      <header className="card-head">
+        <div>
+          <h3>what the runner observed</h3>
+          <p className="card-sub">
+            collected before planning. this is the only thing the model was shown about the target, so the
+            model never reads the page itself.
+          </p>
+        </div>
+      </header>
+      <dl className="facts">
+        {rows.map(([label, value]) => (
+          <div key={label}>
+            <dt>{label}</dt>
+            <dd>{value}</dd>
+          </div>
+        ))}
+      </dl>
+    </section>
+  );
+}
 
 type Props = {
   detail: RunDetailData;
@@ -12,6 +83,8 @@ type Props = {
 
 export default function RunDetail({ detail }: Props) {
   const { run, plan, results, findings } = detail;
+  const facts = parseFacts(run.profile_json);
+  const rounds = plan.rounds ?? [];
   const [tab, setTab] = useState<Tab>("results");
   const [report, setReport] = useState("");
   const [error, setError] = useState("");
@@ -83,11 +156,15 @@ export default function RunDetail({ detail }: Props) {
         <h3>summary</h3>
         <p className="summary">{run.summary || "no summary yet"}</p>
         <p className="hint">
-          {run.summary_source === "model"
-            ? "written by the model. the results and findings below are recorded by the runner from the actual responses."
-            : "written by the runner from the recorded results, not by the model."}
+          {!run.summary
+            ? "the summary is written when the run finishes."
+            : run.summary_source === "model"
+              ? "written by the model. the results and findings below are recorded by the runner from the actual responses."
+              : "written by the runner from the recorded results, not by the model."}
         </p>
       </section>
+
+      {facts && <FactsCard facts={facts} />}
 
       <section className="card">
         <div className="pills">
@@ -143,9 +220,15 @@ export default function RunDetail({ detail }: Props) {
             <p className="hint">no plan yet</p>
           ) : (
             <>
+              {rounds.length > 1 && (
+                <p className="hint">
+                  planned over {rounds.length} rounds, each round seeing the results of the one before
+                </p>
+              )}
               <table>
                 <thead>
                   <tr>
+                    {rounds.length > 1 && <th>round</th>}
                     <th>check</th>
                     <th>why the agent picked it</th>
                   </tr>
@@ -153,6 +236,7 @@ export default function RunDetail({ detail }: Props) {
                 <tbody>
                   {plan.checks.map((item) => (
                     <tr key={item.id}>
+                      {rounds.length > 1 && <td>{item.round ?? 1}</td>}
                       <td>
                         <code>{item.id}</code>
                       </td>
@@ -161,6 +245,14 @@ export default function RunDetail({ detail }: Props) {
                   ))}
                 </tbody>
               </table>
+              {rounds.some((entry) => entry.note) && (
+                <p className="hint">
+                  {rounds
+                    .filter((entry) => entry.note)
+                    .map((entry) => `round ${entry.round}: ${entry.note}`)
+                    .join(" | ")}
+                </p>
+              )}
               {plan.skipped.length > 0 && (
                 <p className="hint">
                   skipped: {plan.skipped.map((item) => `${item.id} (${item.reason})`).join(", ")}

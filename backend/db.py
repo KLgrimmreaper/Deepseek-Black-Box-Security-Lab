@@ -151,9 +151,16 @@ def create_run(db_path, target, notes, model):
         return cursor.lastrowid
 
 
-def set_run_stage(db_path, run_id, stage):
+def set_run_stage(db_path, run_id, stage, request_count=None):
+    # the request count comes along with the stage so the dashboard can show progress while a
+    # run is still going, instead of reading 0 until it finishes
     with db_connection(db_path) as conn:
-        conn.execute("UPDATE runs SET stage = ? WHERE id = ?", (stage, run_id))
+        if request_count is None:
+            conn.execute("UPDATE runs SET stage = ? WHERE id = ?", (stage, run_id))
+        else:
+            conn.execute(
+                "UPDATE runs SET stage = ?, request_count = ? WHERE id = ?", (stage, request_count, run_id)
+            )
 
 
 def set_run_plan(db_path, run_id, planned):

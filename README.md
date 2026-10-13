@@ -35,7 +35,7 @@ five pages, each one showing something the backend actually stored:
 | page | what is on it |
 |---|---|
 | overview | run, check, finding and request totals, findings by severity, findings per run, the checks that failed most, and the spread of results |
-| runs | start a run, the run list with live progress, and the detail for one run with tabs for results, plan, findings and the markdown report |
+| runs | start a run, the run list with live progress, and the detail for one run: the facts the runner observed, then tabs for results, plan, findings and the markdown report |
 | check catalogue | all 13 checks with their severity, what they send, and the fallback fix text |
 | findings | every finding from every run, filterable by severity, with the impact, remediation and raw evidence |
 | settings | the values the backend loaded, and where data, evidence and reports are written |
@@ -44,7 +44,8 @@ the overview and the finding cards are built from real runs only, nothing is see
 above is two smoke runs against a throwaway local http server on purpose, so the numbers are small.
 
 each page has a url, so it can be linked to directly: `#overview`, `#runs`, `#catalogue`,
-`#findings`, `#settings`.
+`#findings`, `#settings`. a single run is linkable too, for example `#runs/24`, which is what makes
+one run easy to share or screenshot.
 
 ![the findings page](docs/dashboard-findings.png)
 

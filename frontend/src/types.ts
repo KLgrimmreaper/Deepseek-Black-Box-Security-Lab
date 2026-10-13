@@ -7,6 +7,7 @@ export type Run = {
   notes: string;
   summary: string;
   summary_source: string;
+  profile_json: string;
   request_count: number;
   error: string | null;
   started_at: string;
@@ -44,8 +45,21 @@ export type Finding = {
 
 export type Plan = {
   source: string;
-  checks: { id: string; reason: string }[];
+  checks: { id: string; reason: string; round?: number }[];
   skipped: { id: string; reason: string }[];
+  rounds?: { round: number; note: string; done: boolean }[];
+};
+
+export type ObservedFacts = {
+  application_shape?: string;
+  login_shape?: string;
+  login_form?: { action?: string; path?: string; same_origin?: boolean; fields?: string[] } | null;
+  search_endpoint?: { path?: string; status?: number; present?: boolean };
+  unknown_path_status?: number;
+  unknown_path_returns_app_shell?: boolean;
+  root_status?: number;
+  root_content_type?: string;
+  untrusted?: { title?: string; server_header?: string; powered_by?: string };
 };
 
 export type RunDetail = {
