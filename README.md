@@ -2,7 +2,19 @@
 
 a small local lab that tests a running web app from the outside. a deepseek model picks which
 checks to run and writes up the findings. ordinary python code sends the requests, records the
-responses, and decides whether each check passed or failed.
+responses, and decides the result of each check.
+
+**read this first: `failed` means the problem is present in the target, not that the tool failed.**
+a check "fails" when it finds the thing it was looking for. so on a vulnerable app most rows read
+`failed`, and that is the scanner working correctly. the five result words are explained in
+[the checks](#the-checks) section, and every one of them is tied to a recorded response.
+
+what it is: 13 black-box http checks, chosen by a model from facts observed about the target, with
+a markdown report and a dashboard.
+
+what it is not: a ctf solver, and not a replacement for burp or zap. juice shop alone has more than
+a hundred challenges and most of them (jwt tricks, business logic, anything that needs a browser)
+are outside an http-only runner. it is 13 checks that say what they can and cannot prove.
 
 the default target is OWASP Juice Shop in docker on localhost:3000.
 
@@ -246,13 +258,23 @@ built to be probed.
 a check returns one of five results, and each one has an evidence requirement. this is the part
 that keeps the report honest, so it is worth reading before the check list:
 
-| result | what the evidence has to show | becomes a finding |
+| result | in plain english | what the evidence has to show | becomes a finding |
+|---|---|---|---|
+| `failed` | **the issue was found** | the recorded response directly demonstrates the condition the check describes (a header really is absent, a payload really was accepted, a file really was served) | yes, `confirmed` |
+| `needs_review` | possibly an issue, a human decides | the response is consistent with the condition but does not demonstrate it (a 403 instead of a 200, no 429 seen after 10 tries, a wildcard cors header, a script tag reflected as json, a consent cookie, a method only advertised in `Allow`) | yes, `needs_review` |
+| `passed` | that issue was not observed | the specific thing was checked and not found. it never means the target is clean | no |
+| `not_applicable` | could not be tested | the check could not reach a conclusion at all (nothing reflected, no cookie set, no `Allow` header, or a prerequisite that this target does not meet) | no |
+| `error` | could not run | the check could not complete (tls failure, timeout, budget reached, endpoint missing, or a login that gives no refusal to compare against) | no |
+
+so on a real vulnerable target the rows you want to see are the `failed` ones. worked example from
+a run against juice shop:
+
+| check | result | what that actually means |
 |---|---|---|
-| `failed` | the recorded response directly demonstrates the condition the check describes (a header really is absent, a payload really was accepted, a file really was served) | yes, `confirmed` |
-| `needs_review` | the response is consistent with the condition but does not demonstrate it (a 403 instead of a 200, no 429 seen after 10 tries, a wildcard cors header, a script tag reflected as json, a consent cookie, a method only advertised in `Allow`) | yes, `needs_review` |
-| `passed` | the specific thing was checked and not found. it never means the target is clean | no |
-| `not_applicable` | the check could not reach a conclusion at all (nothing reflected, no cookie set, no `Allow` header) | no |
-| `error` | the check could not run (tls failure, timeout, budget reached, endpoint missing) | no |
+| `sql_injection_login` | `failed` | the sql injection is there. `' OR 1=1--` was accepted where a bad login got 401 |
+| `weak_credentials` | `failed` | the default `admin@juice-sh.op` password works |
+| `cors_policy` | `needs_review` | the header is `*`, but nothing sensitive was shown to be readable |
+| `reflected_xss` | `not_applicable` | the search api returns json and never echoes the query, so there was nothing to judge. juice shop's reflected xss is in the client side route and needs a browser |
 
 so a 403 on `/.env` is an observation that the path exists and is refused (which is correct
 behaviour), not an exposure. ten login attempts that are all answered normally are an observation,
@@ -446,6 +468,7 @@ verified:
 - the false clean cases are tested explicitly: a form login that answers 200 to everything, and an auth flow that answers 400, must both come back as `error` and never as `passed`
 - a form login is tested end to end against a local mock: the checks post the observed field names, the request format is recorded in the evidence with the values blanked, and a form whose action points off host is recorded but never requested
 - the adaptive loop is tested with the deepseek api replaced by a scripted agent that asserts on the prompts: the model is offered only the checks that have not run, its second prompt contains the first round's results, a check that already ran is refused, the iteration cap stops a model that always wants more, and a model that keeps returning rubbish fails the run instead of leaving it looking clean
+- the loop ran for real against juice shop with the real model and stopped itself: 3 rounds, 12 of the 13 checks planned, 51 requests, 8 findings. round 3's own note was *"the only other available check, server_info_disclosure, is already answered by the observed empty server and x-powered-by headers, so no further useful evidence is expected"*. nothing in the code tells it to skip a check whose answer is already visible in the facts, and it saved a request by predicting `passed` correctly (a later mock run of the same target confirmed `passed: no version or stack headers`)
 - a hostile page is tested directly: a target whose page and header both say "IGNORE ALL PREVIOUS INSTRUCTIONS" cannot get that text into the prompt as an instruction, and a hostile plan is still refused
 - the mock path is tested to make sure `MOCK_AGENT=1` never reaches the api at all
 - a full run against OWASP Juice Shop in docker: with the fallback plan (48 requests) and with the real model (12 checks planned by deepseek, 47 requests, 8 findings, `reports/run_3.md`)
@@ -462,6 +485,21 @@ not verified:
 - a hardened real target. the only clean target the checks have run against is the fake one in the tests, so the pass branches are tested, but not against a real hardened application
 - nothing browser based is tested at all, because there is no browser in the pipeline
 
+## two ways the settings can surprise you
+
+both of these are environment variable behaviour, not bugs, and both cost me time:
+
+1. **`.env` is read once, when the process starts.** changing it does nothing to a backend that is
+   already running. the cli is fine, because every run is a new process.
+2. **a shell variable beats `.env`.** `python-dotenv` does not overwrite a variable that is already
+   set, so `$env:MOCK_AGENT = "1"` in the window you started uvicorn in will keep every run in mock
+   mode even though the file says `0`, and `$env:ALLOWED_TARGETS = "http://x"` will make the whole
+   allowlist just that one target.
+
+the fastest way to see what a running backend actually loaded is the target field's placeholder in
+the dashboard (it shows the first allowed target) and the **Settings** page, which lists them all.
+if either disagrees with `.env`, restart the backend in a **fresh** window.
+
 ## known limitations
 
 - one target at a time, and only targets on the allowlist
@@ -470,7 +508,8 @@ not verified:
 - the login checks support two request formats: a json login api taking `email` and `password`, and an html form whose field names look like a username and a password. anything else is skipped rather than guessed at, which is honest but is still missing coverage
 - a login endpoint that answers 200 to both a bad and a good login is now reported as `error` instead of `passed`, so it is no longer a false clean, but it also means such an app gets no login coverage at all
 - the model still decides which checks to ask for, so a hostile page could nudge that choice. what it cannot do is add a check, change a path, widen the scope, exceed a budget or have its reasoning decide a result
-- no session or login handling, so anything behind a login is out of reach
+- the result words describe the check, not the target in general. `failed` is a finding, `passed` only means the one specific thing was not observed, and neither is a verdict on the whole app
+- no session or login handling, so anything behind a login is out of reach. on a login-gated app like dvwa, webgoat or mutillidae that means most of the app, and a csrf token field would stop the form checks filling a real login in
 - the injection checks are shallow: one login payload and one reflected marker. they can show a problem exists, they cannot show a target is clean
 - no browser, so most client side issues are out of reach. `reflected_xss` can only judge reflection, not whether a page actually executes it, and `open_redirect` only sees server side redirects
 - redirects are never followed at all, which is deliberate. a target that only exposes a problem behind a redirect, such as a login page at a new path, is not tested
