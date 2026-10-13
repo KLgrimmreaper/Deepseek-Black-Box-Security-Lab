@@ -286,11 +286,13 @@ hardened application with labels nobody derived from this code.
 
 verified:
 
-- 76 pytest tests pass (`76 passed in 40.33s`), covering the checks in both fake target modes, the 37 case behaviour matrix, the scope rules over both schemes, the request budget including failed attempts, the evidence-before-finding rule, the stats queries and report generation
+- 82 pytest tests pass (`82 passed in 40.29s`), covering the checks in both fake target modes, the 37 case behaviour matrix, the scope rules over both schemes, the request budget including failed attempts, the evidence-before-finding rule, the stats queries, the interrupted run cleanup and report generation
 - a full run against OWASP Juice Shop in docker: with the fallback plan (48 requests) and with the real model (12 checks planned by deepseek, 47 requests, 8 findings, `reports/run_3.md`)
 - the real deepseek call works end to end: the model planned 12 of the 13 checks with a reason each, wrote the impact and remediation for all 8 findings, and wrote the summary. every one of those texts is labelled as model written in the report and the dashboard
 - the headline finding was checked by hand, not just trusted: a normal bad login returned `401` with 26 bytes of html, and `' OR 1=1--` returned `200` with 799 bytes of json reading `{"authentication":{"token":"[redacted]","bid":1,"umail":"admin@juice-sh.op"}}`, so the injection logs in as the first admin user
 - the false positive fixes were re-run against Juice Shop and moved claims in both directions: its `Access-Control-Allow-Origin: *` now reports `needs_review` with "whether anything sensitive is readable was not established" instead of a confirmed finding, `rate_limit` now reports an observation instead of "no throttling", while `http_methods` (TRACE really answered 200) and `robots_disclosure` (the file really lists paths) moved from `needs_review` to `confirmed`, because those are demonstrated
+- a run against a second, external target (`https://pentest-ground.com:81`, listed by OWASP as intentionally vulnerable) ran end to end over tls: 52 requests, 3 confirmed findings, 1 observation, and 3 checks correctly reported `error` because that app has no `/rest/user/login`, rather than inventing findings
+- the interrupted run cleanup was checked against the real database: a run left in progress by a killed process now shows `failed` with "the process that started it is gone", instead of staying `running` forever
 - tls behaviour is verified against a real tls socket: a trusted local ca is tested normally, an untrusted certificate fails the run with a clear message and zero findings, and a per check tls failure becomes `error`
 - the dashboard typechecks, builds, and its five pages were each loaded in a browser against real data from those runs, which is where the screenshots in this readme come from
 
@@ -309,7 +311,8 @@ not verified:
 - `needs_review` is a judgement call made by the check, not by a person at run time. it means "the evidence does not demonstrate this", which is not the same as "this is probably fine"
 - `cors_policy` only asks the main page, so it cannot tell whether a credentialed api endpoint is readable. it says so in the result
 - checks run one at a time on purpose, so the request budget stays honest and the target is not hammered
-- the run executes in a thread inside the api process, so stopping the api kills a run in progress
+- the run executes in a thread inside the api process, so stopping the api kills a run in progress. that run is then marked `failed` as interrupted the next time the backend starts, because a run only lives inside the process that started it and the row records that process id. this is not a job queue and there is no resume
+- the pid check that closes interrupted runs is windows specific in its implementation (it asks the process handle instead of using `os.kill`, which is not a usable probe there). on other platforms it falls back to `os.kill(pid, 0)`, which i have not tested
 - starting two runs at the same time works (each has its own budget) but both hit the same target
 - the model summary can be vague or wrong. that is exactly why the result column never comes from the model
 - the reasons in the plan table are model commentary, not evidence. against juice shop the model wrote things like "juice shop is famous for accepting well-known demo credentials", which is prior knowledge of a well known target rather than something the recon showed. treat the plan as the agent explaining itself, not as a finding

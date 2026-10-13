@@ -1,8 +1,20 @@
+import ctypes
 import json
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+
+# windows constants for the process liveness check
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+STILL_ACTIVE = 259
+
+# what a run gets told when the process that owned it disappeared
+INTERRUPTED_MESSAGE = (
+    "this run was interrupted: the process that started it is gone, so it could never finish "
+    "and was marked failed instead of staying in progress"
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -10,6 +22,7 @@ CREATE TABLE IF NOT EXISTS runs (
   target TEXT NOT NULL,
   status TEXT NOT NULL,
   stage TEXT NOT NULL DEFAULT '',
+  pid INTEGER,
   model TEXT NOT NULL DEFAULT '',
   notes TEXT NOT NULL DEFAULT '',
   summary TEXT NOT NULL DEFAULT '',
@@ -76,13 +89,57 @@ def init_db(db_path):
         # the api runs a test in a worker thread while the dashboard polls the same file
         conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript(SCHEMA)
+        # databases created before the pid column existed need it added in place, because
+        # CREATE TABLE IF NOT EXISTS leaves an existing table alone
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(runs)")}
+        if "pid" not in columns:
+            conn.execute("ALTER TABLE runs ADD COLUMN pid INTEGER")
+
+
+def _pid_alive(pid):
+    # a run only lives inside the process that started it, so its pid tells us whether it can
+    # still finish. os.kill(pid, 0) is not usable on windows (a dead id can return normally and
+    # a live one can raise), so windows asks the process handle directly
+    if not pid:
+        return False
+    if os.name == "nt":
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def mark_interrupted_runs(db_path):
+    with db_connection(db_path) as conn:
+        rows = conn.execute("SELECT id, pid FROM runs WHERE status = 'running'").fetchall()
+        stale = [row["id"] for row in rows if not _pid_alive(row["pid"])]
+        for run_id in stale:
+            conn.execute(
+                "UPDATE runs SET status = 'failed', stage = '', error = ?, finished_at = ? WHERE id = ?",
+                (INTERRUPTED_MESSAGE, now(), run_id),
+            )
+        return len(stale)
 
 
 def create_run(db_path, target, notes, model):
     with db_connection(db_path) as conn:
         cursor = conn.execute(
-            "INSERT INTO runs (target, status, stage, model, notes, started_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (target, "running", "starting", model, notes, now()),
+            "INSERT INTO runs (target, status, stage, pid, model, notes, started_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (target, "running", "starting", os.getpid(), model, notes, now()),
         )
         return cursor.lastrowid
 

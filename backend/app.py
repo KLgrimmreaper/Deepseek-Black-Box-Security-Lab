@@ -1,4 +1,5 @@
 import threading
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -12,7 +13,20 @@ from .config import BASE_DIR, load_config
 from .runner import create_run, execute_run
 from .scope import Scope, ScopeError
 
-app = FastAPI(title="deepseek black-box security lab")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    config = load_config()
+    # make sure the tables exist, and close any run left in progress by a killed or restarted
+    # backend. those runs can never finish, and leaving them running makes the dashboard poll a ghost
+    db.init_db(config["db_path"])
+    interrupted = db.mark_interrupted_runs(config["db_path"])
+    if interrupted:
+        print(f"marked {interrupted} interrupted run(s) as failed")
+    yield
+
+
+app = FastAPI(title="deepseek black-box security lab", lifespan=lifespan)
 
 
 class NewRun(BaseModel):
