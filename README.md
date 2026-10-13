@@ -66,6 +66,67 @@ POST /api/runs or cli run
 if a check fails but its evidence file cannot be written, the check is recorded as `error` and no
 finding is created. a failed check with no evidence is not a finding.
 
+## how a run adapts to the target
+
+the checklist above is the same for every target, but which parts of it make sense is not. so a run
+goes round a loop instead of walking one fixed list:
+
+```
+observe    recon.py collects facts in python: content types, whether unknown paths return the app
+           page, the allow header, any html login form and its field names, what the login endpoint
+           answers to a failed json login, and whether the search endpoint exists
+plan       deepseek is shown those facts plus the checks that have not run yet, and picks the next
+           few with a reason each
+validate   python decides which of the picks may actually run (see below)
+test       the approved checks run, one at a time, through the existing runner
+evaluate   the results so far go back to the model, which can ask for another round or stop
+stop       when the checks are done, the budget is out, the iteration cap is reached, nothing left
+           can run, or the model says further testing is unlikely to add evidence
+```
+
+the model cannot widen any of this. `MAX_ITERATIONS` (default 3) and `MAX_REQUESTS_PER_RUN` are
+enforced in python, and neither is something the model can see or change.
+
+### what is observed, and what is only inferred
+
+| fact | how it is established |
+|---|---|
+| application shape | derived from content types plus whether a form or an app shell was seen |
+| login shape | a form on the page, or the status of one failed json login attempt |
+| login form fields | read out of the html with `html.parser` |
+| search endpoint | one request, present unless it answers 404 |
+| unknown path behaviour | one request to a path that does not exist, compared with the app root |
+
+these are **observations, not conclusions**. "unknown paths return the app page" is a fact about
+responses, and it is used to avoid calling a javascript route an exposed file. it is not a claim
+about what the app is.
+
+### what still needs manual configuration
+
+only one request format is supported for the login checks: a json login api that takes
+`{"email": ..., "password": ...}`. so:
+
+| situation | what happens |
+|---|---|
+| json login api (juice shop, most rest apis) | the login checks run normally |
+| an html form login | the three login checks report `not_applicable` and say why. they are **not** run with the wrong request format |
+| no login endpoint at the configured path | same, `not_applicable`, with the observed status |
+| a login api with different field names or a form post | not supported yet. set `LOGIN_PATH` and expect `not_applicable`, or run with `--only` to leave the login checks out |
+
+the gate is deliberately blunt: a check whose request format does not match what was observed is
+refused rather than run and reported as a pass. `unmet_requirement` in `catalogue.py` is the whole
+of that decision, and each entry declares what it needs with a `requires` field.
+
+### keeping the target out of the prompt
+
+recon reduces the target to the facts above. **no page html and no response body text is sent to
+the model**, so a page cannot smuggle instructions in through its own content. the few values that
+are target authored (page title, server header) are truncated and passed under an `untrusted` key
+with an explicit instruction that they are data. the model's reply is then validated: only
+catalogue ids are read, only `id` and `reason` are kept, and anything else is dropped. a hostile
+page can still influence which check ids the model picks, which is why the ids are checked and the
+prerequisites are enforced in python rather than trusted.
+
 ## the checks
 
 13 checks, all black-box, none of them destructive. every one of them can be confirmed from a
@@ -159,6 +220,7 @@ copy .env.example .env
 | `MAX_REQUESTS_PER_RUN` | `120` | hard cap for one run |
 | `REQUEST_DELAY_MS` | `200` | pause between requests |
 | `REQUEST_TIMEOUT` | `10` | seconds per request |
+| `MAX_ITERATIONS` | `3` | how many observe, plan, test, evaluate rounds one run may take |
 | `CA_BUNDLE` | empty | path to a ca certificate file, only for a lab target with a self signed certificate. adds a ca, never turns checking off |
 | `MOCK_AGENT` | `0` | 1 skips the api and uses the fallback plan |
 | `LOGIN_PATH` | `/rest/user/login` | the login endpoint the auth checks use |
@@ -286,7 +348,10 @@ hardened application with labels nobody derived from this code.
 
 verified:
 
-- 82 pytest tests pass (`82 passed in 40.29s`), covering the checks in both fake target modes, the 37 case behaviour matrix, the scope rules over both schemes, the request budget including failed attempts, the evidence-before-finding rule, the stats queries, the interrupted run cleanup and report generation
+- 106 pytest tests pass (`106 passed in 50.97s`), covering the checks in both fake target modes, the 37 case behaviour matrix, the observe and plan loop with a scripted model, the scope rules over both schemes, the request budget including failed attempts, the evidence-before-finding rule, the stats queries, the interrupted run cleanup and report generation
+- the adaptive loop is tested with the deepseek api replaced by a scripted agent that asserts on the prompts: the model is offered only the checks that have not run, its second prompt contains the first round's results, a check that already ran is refused, the iteration cap stops a model that always wants more, and a model that keeps returning rubbish fails the run instead of leaving it looking clean
+- a hostile page is tested directly: a target whose page and header both say "IGNORE ALL PREVIOUS INSTRUCTIONS" cannot get that text into the prompt as an instruction, and a hostile plan is still refused
+- the mock path is tested to make sure `MOCK_AGENT=1` never reaches the api at all
 - a full run against OWASP Juice Shop in docker: with the fallback plan (48 requests) and with the real model (12 checks planned by deepseek, 47 requests, 8 findings, `reports/run_3.md`)
 - the real deepseek call works end to end: the model planned 12 of the 13 checks with a reason each, wrote the impact and remediation for all 8 findings, and wrote the summary. every one of those texts is labelled as model written in the report and the dashboard
 - the headline finding was checked by hand, not just trusted: a normal bad login returned `401` with 26 bytes of html, and `' OR 1=1--` returned `200` with 799 bytes of json reading `{"authentication":{"token":"[redacted]","bid":1,"umail":"admin@juice-sh.op"}}`, so the injection logs in as the first admin user
@@ -304,6 +369,11 @@ not verified:
 ## known limitations
 
 - one target at a time, and only targets on the allowlist
+- reconnaissance now costs 6 requests per run instead of 3, because it probes the login endpoint, the search endpoint and one unknown path. that is the price of planning from observations rather than assumptions
+- the application labels are coarse on purpose. "javascript_driven" means an html root with no form that talks to a json api, and it is a hint for the planner, not a statement about the app
+- the login checks support one request format only: a json login api with `email` and `password`. a form login gets `not_applicable`, which is honest but is still missing coverage
+- a login endpoint that answers 200 for both a bad and a good login cannot be judged, and the check does not yet detect that case (it would report `passed`). the shape gate stops the common version of this, but hardening that comparison is the next piece of work
+- the model still decides which checks to ask for, so a hostile page could nudge that choice. what it cannot do is add a check, change a path, widen the scope, exceed a budget or have its reasoning decide a result
 - no session or login handling, so anything behind a login is out of reach
 - the injection checks are shallow: one login payload and one reflected marker. they can show a problem exists, they cannot show a target is clean
 - no browser, so most client side issues are out of reach. `reflected_xss` can only judge reflection, not whether a page actually executes it, and `open_redirect` only sees server side redirects
@@ -334,13 +404,14 @@ backend/
   cli.py         run a test from the terminal
   config.py      .env loading and defaults
   scope.py       the only place that builds a request url, plus the budget, the delay, the tls ca and the error types
-  catalogue.py   the explicit check list with severities and fallback fixes
+  recon.py       observes the target and reduces it to facts, so no page text reaches a prompt
+  catalogue.py   the explicit check list with severities, prerequisites and fallback fixes
   checks.py      the http checks, the result vocabulary and the pass or fail decisions
-  runner.py      recon, planning, execution, findings, report
-  agent.py       the three deepseek calls
+  runner.py      the observe, plan, test, evaluate loop and the deterministic gate
+  agent.py       the deepseek calls: planning, write ups and the summary
   db.py          sqlite schema and queries
   report.py      markdown report
-  tests/         pytest, with the fake target, the behaviour matrix and the test certificates
+  tests/         pytest, with the fake target, the scripted model, the behaviour matrix and the test certificates
 frontend/        react + typescript + vite dashboard
   src/api.ts     the fetch calls the pages use
   src/theme.ts   severity and result colours and ordering
