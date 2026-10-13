@@ -67,10 +67,37 @@ def test_recon_finds_an_html_login_form(tmp_path):
         cfg = make_config(target.origin, tmp_path)
         run_checks(target, cfg, only=["security_headers"])
         profile = json.loads(db.get_run(cfg["db_path"], 1)["profile_json"])
+        form = profile["login_form"]
 
         assert profile["application_shape"] == "server_rendered_html"
         assert profile["login_shape"] == "html_form"
-        assert profile["login_form"] == {"action": "/login", "method": "post", "fields": ["username", "password"]}
+        assert form["action"] == "/login"
+        assert form["path"] == f"{target.origin}/login"
+        assert form["same_origin"] is True
+        assert form["method"] == "post"
+        assert form["fields"] == ["username", "password"]
+    finally:
+        target.stop()
+
+
+def test_a_form_that_posts_to_another_host_is_recorded_but_not_used(tmp_path):
+    target = FakeTarget(form_login=True, form_action="https://evil.example/login")
+    try:
+        cfg = make_config(target.origin, tmp_path)
+        run_id = run_checks(target, cfg, only=["security_headers"])[0]
+        profile = json.loads(db.get_run(cfg["db_path"], run_id)["profile_json"])
+
+        # the action is recorded as an observation, but it has no usable path on this target
+        assert profile["login_form"]["action"] == "https://evil.example/login"
+        assert profile["login_form"]["same_origin"] is False
+        assert profile["login_form"]["path"] == ""
+
+        # the page body quotes that action and storing the body is correct, but no request may
+        # ever be recorded against it
+        for path in (tmp_path / "evidence" / str(run_id)).glob("*.json"):
+            text = path.read_text(encoding="utf-8")
+            assert '"url": "https://evil.example' not in text
+            assert f'"url": "{target.origin}' in text
     finally:
         target.stop()
 
@@ -93,8 +120,9 @@ def test_recon_spots_an_app_that_answers_everything_with_200(tmp_path):
 
 # --- validate --------------------------------------------------------------
 
-def test_login_checks_are_not_run_against_an_html_form(tmp_path, monkeypatch):
-    target = FakeTarget(form_login=True)
+def test_login_checks_are_skipped_when_the_form_cannot_be_filled_in(tmp_path, monkeypatch):
+    # the field names do not say which one is the password, so nothing is guessed
+    target = FakeTarget(form_login=True, form_fields=("user_id", "secret"))
     try:
         fake_agent.install(monkeypatch, [fake_agent.plan("sql_injection_login", "weak_credentials", "rate_limit")])
         cfg = real_model_config(target, tmp_path)
@@ -103,7 +131,7 @@ def test_login_checks_are_not_run_against_an_html_form(tmp_path, monkeypatch):
 
         for check_id in ["sql_injection_login", "weak_credentials", "rate_limit"]:
             assert results[check_id]["result"] == "not_applicable"
-            assert "html form" in results[check_id]["detail"]
+            assert "could not be mapped" in results[check_id]["detail"]
         # the important part: not one of them was reported as a pass
         assert not any(row["result"] == "passed" for row in results.values())
         assert db.get_findings(cfg["db_path"], run_id) == []
@@ -288,7 +316,7 @@ def test_the_budget_stops_the_loop(tmp_path, monkeypatch):
 
 
 def test_a_second_round_that_cannot_run_anything_stops_cleanly(tmp_path, monkeypatch):
-    target = FakeTarget(form_login=True)
+    target = FakeTarget(form_login=True, form_fields=("user_id", "secret"))
     try:
         fake_agent.install(
             monkeypatch,
@@ -408,11 +436,29 @@ def test_mock_mode_never_calls_the_api(tmp_path, monkeypatch):
         target.stop()
 
 
-@pytest.mark.parametrize("shape,expected", [("json", None), ("html_form", "html form"), ("absent", "no json login")])
-def test_the_gate_reason_matches_the_observed_shape(shape, expected):
+@pytest.mark.parametrize(
+    "shape,form,expected",
+    [
+        ("json", None, None),
+        ("html_form", {"path": "/login", "same_origin": True, "fields": ["username", "password"]}, None),
+        (
+            "html_form",
+            {"path": "/login", "same_origin": True, "fields": ["user_id", "secret"]},
+            "could not be mapped",
+        ),
+        (
+            "html_form",
+            {"path": "", "same_origin": False, "fields": ["username", "password"]},
+            "another host",
+        ),
+        ("absent", None, "no usable login endpoint"),
+        ("unknown", None, "no usable login endpoint"),
+    ],
+)
+def test_the_gate_reason_matches_what_was_observed(shape, form, expected):
     from backend.catalogue import CATALOGUE_BY_ID, unmet_requirement
 
-    profile = {"login_shape": shape, "search_endpoint": {"path": "/s", "status": 200, "present": True}}
+    profile = {"login_shape": shape, "login_form": form, "search_endpoint": {"path": "/s", "status": 200, "present": True}}
     reason = unmet_requirement(CATALOGUE_BY_ID["sql_injection_login"], profile)
     if expected is None:
         assert reason is None

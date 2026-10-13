@@ -102,8 +102,12 @@ def test_a_hardened_target_reports_no_findings(tmp_path):
         for row in results.values():
             counts[row["result"]] = counts.get(row["result"], 0) + 1
 
-        assert counts == {"passed": 12, "not_applicable": 1}
+        # this target throttles logins after three attempts, so the credential list runs into a
+        # 429 and that check reports error rather than claiming the passwords were refused
+        assert counts == {"passed": 11, "not_applicable": 1, "error": 1}
         assert results["robots_disclosure"]["result"] == "not_applicable"
+        assert results["weak_credentials"]["result"] == "error"
+        assert "throttling" in results["weak_credentials"]["detail"]
         assert db.get_findings(cfg["db_path"], run_id) == []
     finally:
         target.stop()

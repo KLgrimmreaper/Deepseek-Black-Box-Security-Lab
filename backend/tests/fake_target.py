@@ -1,3 +1,4 @@
+import argparse
 import json
 import ssl
 import threading
@@ -67,6 +68,11 @@ class FakeTarget:
         generic_200=False,
         injection_text=False,
         login_error_html=False,
+        form_ambiguous=False,
+        form_action=None,
+        form_fields=("username", "password"),
+        login_unsupported=False,
+        port=0,
     ):
         self.hardened = hardened
         self.tls = tls
@@ -82,10 +88,14 @@ class FakeTarget:
         self.generic_200 = generic_200
         self.injection_text = injection_text
         self.login_error_html = login_error_html
+        self.form_ambiguous = form_ambiguous
+        self.form_action = form_action
+        self.form_fields = list(form_fields)
+        self.login_unsupported = login_unsupported
         self.valid_logins = {("admin@example.com", "fakepass1")}
         self.login_attempts = 0
 
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._build_handler())
+        self.server = ThreadingHTTPServer(("127.0.0.1", port), self._build_handler())
         if tls:
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             context.load_cert_chain(SERVER_CERT, SERVER_KEY)
@@ -128,8 +138,13 @@ class FakeTarget:
 
             def _root_body(self):
                 title = INJECTION_TEXT if target.injection_text else TARGET_TITLE
-                extra = LOGIN_FORM_HTML if target.form_login else '<a href="/about">about</a>'
+                extra = self._login_form_html() if target.form_login else '<a href="/about">about</a>'
                 return f"<html><head><title>{title}</title></head><body>{ROOT_HTML}{extra}</body></html>"
+
+            def _login_form_html(self):
+                action = target.form_action if target.form_action is not None else "/login"
+                fields = "".join(f'<input type="text" name="{name}">' for name in target.form_fields)
+                return f'<form action="{action}" method="post">{fields}<input type="submit" value="Login"></form>'
 
             def _page_headers(self, cors=False):
                 if target.hardened:
@@ -255,13 +270,14 @@ class FakeTarget:
             def do_POST(self):
                 route = urlsplit(self.path).path
                 if target.form_login and route == "/login":
-                    # a form login that answers 200 with the page again, so there is no clear
-                    # accepted or rejected signal to compare against
-                    self._read_body()
-                    target.login_attempts += 1
-                    return self._send(200, LOGIN_FORM_HTML + "<p>invalid credentials</p>")
+                    return self._form_login()
+
                 if route != LOGIN_PATH:
                     return self._send(404, "not found", "text/plain")
+                if target.login_unsupported:
+                    # an authentication flow this scanner cannot satisfy, for example something
+                    # that wants a client certificate or a second factor
+                    return self._send(400, json.dumps({"error": "unsupported authentication flow"}), "application/json")
                 body = self._read_body()
                 try:
                     data = json.loads(body)
@@ -300,4 +316,62 @@ class FakeTarget:
                     return self._send(401, "Invalid email or password.", "text/html; charset=utf-8")
                 return self._send(401, json.dumps({"error": "invalid credentials"}), "application/json")
 
+            def _form_login(self):
+                """a server rendered login: success redirects away, failure redirects back.
+
+                form_ambiguous makes it answer 200 with the form every time, which is the case
+                where an accepted and a refused login cannot be told apart.
+                """
+                body = self._read_body()
+                data = parse_qs(body)
+                username = (data.get(target.form_fields[0]) or [""])[0]
+                password = (data.get(target.form_fields[1]) or [""])[0]
+                target.login_attempts += 1
+
+                if target.form_ambiguous:
+                    return self._send(200, self._login_form_html() + "<p>invalid credentials</p>")
+
+                vulnerable = not target.hardened and "' OR 1=1" in username
+                if vulnerable or (username, password) in target.valid_logins and not target.hardened:
+                    return self._send(
+                        302, "", extra_headers={"Location": "/dashboard", "Set-Cookie": "session=fake; Path=/"}
+                    )
+                return self._send(302, "", extra_headers={"Location": "/login?error=1"})
+
         return Handler
+
+
+# one named mock application per behaviour worth demonstrating by hand
+PROFILES = {
+    "json-vulnerable": {},
+    "json-hardened": {"hardened": True},
+    "form-vulnerable": {"form_login": True},
+    "form-hardened": {"form_login": True, "hardened": True},
+    "form-ambiguous-200": {"form_login": True, "form_ambiguous": True},
+    "form-off-host": {"form_login": True, "form_action": "https://evil.example/login"},
+    "form-odd-fields": {"form_login": True, "form_fields": ("user_id", "secret")},
+    "unsupported-auth": {"login_unsupported": True},
+    "prompt-injection": {"injection_text": True},
+}
+
+
+def main():
+    """starts one of the mock applications so a run can be demonstrated against it."""
+    parser = argparse.ArgumentParser(description="run one of the mock lab applications")
+    parser.add_argument("--profile", choices=sorted(PROFILES), default="json-vulnerable")
+    parser.add_argument("--port", type=int, default=0, help="0 picks a free port")
+    args = parser.parse_args()
+
+    target = FakeTarget(port=args.port, **PROFILES[args.profile])
+    print(f"{args.profile} mock app listening on {target.origin}")
+    print("add that origin to ALLOWED_TARGETS in .env, then point a run at it")
+    print("press ctrl+c to stop")
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        target.stop()
+
+
+if __name__ == "__main__":
+    main()
