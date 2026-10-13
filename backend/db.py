@@ -157,3 +157,64 @@ def get_findings(db_path, run_id):
             (run_id,),
         ).fetchall()
         return [dict(row) for row in rows]
+
+
+def list_findings(db_path, limit=100):
+    # newest first, with the target of the run they came from
+    with db_connection(db_path) as conn:
+        rows = conn.execute(
+            "SELECT findings.*, runs.target, runs.started_at FROM findings "
+            "JOIN runs ON runs.id = findings.run_id ORDER BY findings.id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def get_stats(db_path):
+    with db_connection(db_path) as conn:
+        totals = dict(
+            conn.execute(
+                "SELECT COUNT(*) AS runs, "
+                "(SELECT COUNT(*) FROM runs WHERE status = 'finished') AS finished, "
+                "(SELECT COUNT(*) FROM runs WHERE status = 'failed') AS failed, "
+                "(SELECT COUNT(*) FROM check_results) AS checks_run, "
+                "(SELECT COUNT(*) FROM findings) AS findings, "
+                "(SELECT COALESCE(SUM(request_count), 0) FROM runs) AS requests "
+                "FROM runs"
+            ).fetchone()
+        )
+        by_severity = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT severity AS label, COUNT(*) AS value FROM findings GROUP BY severity"
+            ).fetchall()
+        ]
+        by_result = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT result AS label, COUNT(*) AS value FROM check_results GROUP BY result"
+            ).fetchall()
+        ]
+        top_checks = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT check_id AS label, COUNT(*) AS value FROM check_results WHERE result = 'failed' "
+                "GROUP BY check_id ORDER BY value DESC LIMIT 6"
+            ).fetchall()
+        ]
+        # findings per run, oldest first, so the chart reads left to right
+        trend = [
+            {"label": row["started_at"][5:10], "value": row["value"]}
+            for row in conn.execute(
+                "SELECT runs.started_at, (SELECT COUNT(*) FROM findings WHERE findings.run_id = runs.id) AS value "
+                "FROM runs ORDER BY runs.id DESC LIMIT 20"
+            ).fetchall()
+        ]
+        trend.reverse()
+    return {
+        "totals": totals,
+        "by_severity": by_severity,
+        "by_result": by_result,
+        "top_failing_checks": top_checks,
+        "trend": trend,
+    }

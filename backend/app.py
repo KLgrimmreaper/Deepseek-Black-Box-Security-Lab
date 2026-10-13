@@ -39,6 +39,18 @@ def list_checks():
     return {"checks": CATALOGUE}
 
 
+@app.get("/api/stats")
+def get_stats():
+    config = load_config()
+    return db.get_stats(config["db_path"])
+
+
+@app.get("/api/findings")
+def get_findings():
+    config = load_config()
+    return {"findings": db.list_findings(config["db_path"])}
+
+
 @app.post("/api/runs")
 def start_run(payload: NewRun):
     config = load_config()
