@@ -653,12 +653,16 @@ tr:last-child td {
   color: var(--high);
 }
 
+.result.needs_review {
+  color: var(--medium);
+}
+
 .result.passed {
   color: var(--ok);
 }
 
 .result.error {
-  color: var(--medium);
+  color: #a855f7;
 }
 
 .result.not_applicable {

@@ -74,27 +74,42 @@ built to be probed.
 
 | id | category | severity | what it does |
 |---|---|---|---|
-| `security_headers` | misconfiguration | low | looks for missing csp, x-frame-options, x-content-type-options, referrer-policy (hsts is skipped on http targets) |
+| `security_headers` | misconfiguration | low | looks for missing csp, x-frame-options, x-content-type-options, referrer-policy (hsts is skipped on http targets and required on https) |
 | `server_info_disclosure` | information leak | info | reports `server`, `x-powered-by` and similar headers |
 | `cookie_flags` | session handling | medium | checks set-cookie on the main page and the login endpoint for secure, httponly, samesite |
 | `cors_policy` | misconfiguration | medium | sends `origin: https://evil.example` and checks if it is reflected, especially with allow-credentials |
-| `http_methods` | misconfiguration | low | sends options and trace, flags trace, put, delete or patch |
+| `http_methods` | misconfiguration | low | sends options and trace, flags trace answering 200, and notes risky methods that are only advertised |
 | `robots_disclosure` | information leak | info | reads robots.txt and sitemap.xml for path hints |
-| `sensitive_paths` | exposure | medium | 16 fixed paths (`/.env`, `/.git/HEAD`, `/ftp`, `/metrics`, ...), reports the ones that answer 200, 401 or 403 |
+| `sensitive_paths` | exposure | medium | 16 fixed paths (`/.env`, `/.git/HEAD`, `/ftp`, `/metrics`, ...). only content served without authentication is a finding |
 | `error_disclosure` | information leak | low | sends malformed input, looks for stack traces and database errors in the body |
 | `sql_injection_login` | injection | high | baseline bad login, then `' OR 1=1--`, compares the two responses |
-| `reflected_xss` | injection | high | puts a marker plus a script tag in the search parameter, checks if the tags come back unencoded |
+| `reflected_xss` | injection | high | puts a marker plus a script tag in the search parameter, checks if the tags come back unencoded in an html response |
 | `open_redirect` | misconfiguration | medium | tries the `to`, `next` and `url` parameters with an off site address |
 | `weak_credentials` | authentication | high | tries 5 well known demo passwords against the login endpoint |
-| `rate_limit` | authentication | low | 10 quick failed logins, reports whether anything answered 429 or 503 |
+| `rate_limit` | authentication | low | 10 quick failed logins, reports throttling when it appears as a 429, a lockout, or clearly slower answers |
 
-a check returns `passed`, `failed`, `error` or `not_applicable`. `not_applicable` means the check
-could not reach a conclusion, for example a reflected xss check where the parameter is not
-reflected at all, or a password check where the login endpoint does not exist.
+a check returns one of five results, and each one has an evidence requirement. this is the part
+that keeps the report honest, so it is worth reading before the check list:
 
-findings from the softer checks (`server_info_disclosure`, `robots_disclosure`, `rate_limit`,
-`http_methods`) are marked `needs_review` instead of `confirmed`, because a human should decide
-whether they count.
+| result | what the evidence has to show | becomes a finding |
+|---|---|---|
+| `failed` | the recorded response directly demonstrates the condition the check describes (a header really is absent, a payload really was accepted, a file really was served) | yes, `confirmed` |
+| `needs_review` | the response is consistent with the condition but does not demonstrate it (a 403 instead of a 200, no 429 seen after 10 tries, a wildcard cors header, a script tag reflected as json, a consent cookie, a method only advertised in `Allow`) | yes, `needs_review` |
+| `passed` | the specific thing was checked and not found. it never means the target is clean | no |
+| `not_applicable` | the check could not reach a conclusion at all (nothing reflected, no cookie set, no `Allow` header) | no |
+| `error` | the check could not run (tls failure, timeout, budget reached, endpoint missing) | no |
+
+so a 403 on `/.env` is an observation that the path exists and is refused (which is correct
+behaviour), not an exposure. ten login attempts that are all answered normally are an observation,
+because ten requests cannot show that throttling is absent. and a `*` cors header is an
+observation, because nothing sensitive was shown to be readable.
+
+the same rule made two checks stricter in the other direction: `TRACE` answering with 200 is
+directly demonstrated, so `http_methods` reports `failed` for that and `needs_review` for a method
+that is merely listed in `Allow`.
+
+findings from `needs_review` results are marked `needs_review` instead of `confirmed`, and the
+report and dashboard both show which is which.
 
 `sensitive_paths` compares each 200 response against the app root. single page apps answer 200
 with the app shell for unknown paths, and reporting that as an exposed file would be a false
@@ -105,11 +120,11 @@ positive, so identical bodies are ignored.
 these are all in ordinary code, outside the model:
 
 - the target has to match an entry in `ALLOWED_TARGETS` exactly, so `http://localhost:3001` is refused when only `http://localhost:3000` is listed
-- redirects are never followed, so a redirect cannot walk the runner off the allowed host
-- `MAX_REQUESTS_PER_RUN` (default 120) is counted in the scope object and the run stops with an error when it is reached
+- redirects are never followed. every request is sent with `allow_redirects=False`, so there are no redirect hops to validate and no way for a redirect to walk the runner off the allowed host. `open_redirect` records the `Location` header without visiting it
+- `MAX_REQUESTS_PER_RUN` (default 120) is counted **before** each request goes out, so a timeout, a refused connection or an error still costs budget. a refused request (off host, or over budget) costs nothing, because nothing was sent
 - `REQUEST_DELAY_MS` (default 200) between requests
 - response bodies are truncated to 8kb when read and to 2kb in the evidence files
-- login evidence stores the status and headers but not the response body, because a successful login response contains a session token
+- login evidence keeps the response body so a finding can be checked, but the value of any `token` or `password` field is replaced with `[redacted]`
 - the evidence endpoint only serves files for check ids that exist in the catalogue, so the path cannot be talked out of the evidence folder
 - the api key is only read from the environment, `.env` is gitignored
 
@@ -144,10 +159,43 @@ copy .env.example .env
 | `MAX_REQUESTS_PER_RUN` | `120` | hard cap for one run |
 | `REQUEST_DELAY_MS` | `200` | pause between requests |
 | `REQUEST_TIMEOUT` | `10` | seconds per request |
+| `CA_BUNDLE` | empty | path to a ca certificate file, only for a lab target with a self signed certificate. adds a ca, never turns checking off |
 | `MOCK_AGENT` | `0` | 1 skips the api and uses the fallback plan |
 | `LOGIN_PATH` | `/rest/user/login` | the login endpoint the auth checks use |
 | `SEARCH_PATH` | `/rest/products/search` | the search endpoint the xss check uses |
 | `LAB_CREDENTIALS` | 5 demo logins | `email:password` pairs for the weak credentials check |
+
+## http and https targets
+
+both schemes are accepted, and the scheme is part of the allowlist match, so `https://localhost:3000`
+and `http://localhost:3000` are two different targets and each has to be listed:
+
+```ini
+ALLOWED_TARGETS=https://localhost:3000
+```
+
+- certificate checking stays on. nothing in the code passes `verify=False`, and there is no option
+  to turn it off. a failure is reported as `error`, never as a finding
+- if the lab target uses a self signed certificate, point `CA_BUNDLE` at the ca file and the checks
+  run normally:
+  ```ini
+  CA_BUNDLE=C:/certs/lab-ca.pem
+  ```
+  a relative path is resolved from the project folder. if the file is missing the run stops with a
+  clear message instead of failing on every request
+- over https, `security_headers` requires `strict-transport-security`. over http it skips it,
+  because browsers ignore hsts on plain http
+- redirects are never followed, over either scheme. a `302` to another host is recorded in the
+  evidence as the response, and no request is made to the destination
+
+what a connection problem looks like, rather than a vulnerability:
+
+| what happened | recorded as |
+|---|---|
+| untrusted or self signed certificate | run `failed`, or the check `error`, with `tls certificate verification failed` and no finding |
+| host refuses the connection | `could not connect to <target>` |
+| host accepts but never answers | `did not answer within 10s` (or whatever `REQUEST_TIMEOUT` is) |
+| budget reached mid check | that check `error` with `request budget of 120 reached`, the run still finishes |
 
 ## running it
 
@@ -207,22 +255,48 @@ tests:
 ```
 
 the checks are tested against an in-process fake target (a small `http.server` in
-`backend/tests/fake_target.py`) with a deliberately sloppy mode and a hardened mode. that means
-the checks are tested for both false negatives and false positives without needing docker.
+`backend/tests/fake_target.py`) with a deliberately sloppy mode and a hardened mode, plus single
+behaviour switches so one check can be pinned down at a time. the https tests use a throwaway
+certificate authority in `backend/tests/certs/` so they need no network and no extra package.
+
+## the behaviour matrix
+
+`backend/tests/test_behaviour_matrix.py` holds 37 labelled cases. each one states what the target
+does and what result the check has to return, written by hand next to the behaviour rather than
+taken from the check. if a check starts claiming more than its evidence supports, the row fails.
+
+```
+37 cases covering all 13 checks
+12 expect failed          12 expect passed
+ 9 expect needs_review     4 expect not_applicable
+plus 1 run level row where the host is dead and the run has to fail without a finding
+```
+
+each row also asserts the finding status, so the vocabulary is tested end to end: `failed` has to
+produce a `confirmed` finding, `needs_review` has to produce a `needs_review` finding, and the
+other three results must produce no finding at all.
+
+this is not a precision and recall benchmark, and i am not going to dress it up as one. the target
+and the labels come from the same person, so recall here is true by construction. what it does
+prove is that each check returns the documented result for a known behaviour, and that the cases
+which used to be over-claimed now land in `needs_review`. real precision and recall would need a
+hardened application with labels nobody derived from this code.
 
 ## what works and what i have verified
 
 verified:
 
-- 20 pytest tests pass (`20 passed in 5.59s`), covering the checks in both fake target modes, the scope rules, the request budget, the evidence-before-finding rule, the stats queries and report generation
-- a full run against OWASP Juice Shop in docker, twice: once with the fallback plan (48 requests, 8 findings) and once with the real model (12 checks planned by deepseek, 47 requests, 8 findings, `reports/run_3.md`)
+- 76 pytest tests pass (`76 passed in 40.33s`), covering the checks in both fake target modes, the 37 case behaviour matrix, the scope rules over both schemes, the request budget including failed attempts, the evidence-before-finding rule, the stats queries and report generation
+- a full run against OWASP Juice Shop in docker: with the fallback plan (48 requests) and with the real model (12 checks planned by deepseek, 47 requests, 8 findings, `reports/run_3.md`)
 - the real deepseek call works end to end: the model planned 12 of the 13 checks with a reason each, wrote the impact and remediation for all 8 findings, and wrote the summary. every one of those texts is labelled as model written in the report and the dashboard
 - the headline finding was checked by hand, not just trusted: a normal bad login returned `401` with 26 bytes of html, and `' OR 1=1--` returned `200` with 799 bytes of json reading `{"authentication":{"token":"[redacted]","bid":1,"umail":"admin@juice-sh.op"}}`, so the injection logs in as the first admin user
+- the false positive fixes were re-run against Juice Shop and moved claims in both directions: its `Access-Control-Allow-Origin: *` now reports `needs_review` with "whether anything sensitive is readable was not established" instead of a confirmed finding, `rate_limit` now reports an observation instead of "no throttling", while `http_methods` (TRACE really answered 200) and `robots_disclosure` (the file really lists paths) moved from `needs_review` to `confirmed`, because those are demonstrated
+- tls behaviour is verified against a real tls socket: a trusted local ca is tested normally, an untrusted certificate fails the run with a clear message and zero findings, and a per check tls failure becomes `error`
 - the dashboard typechecks, builds, and its five pages were each loaded in a browser against real data from those runs, which is where the screenshots in this readme come from
 
 not verified:
 
-- a hardened real target. the only clean target the checks have run against is the fake one in the tests, so the pass branches are tested but not against a real hardened app
+- a hardened real target. the only clean target the checks have run against is the fake one in the tests, so the pass branches are tested, but not against a real hardened application
 - nothing browser based is tested at all, because there is no browser in the pipeline
 
 ## known limitations
@@ -230,13 +304,17 @@ not verified:
 - one target at a time, and only targets on the allowlist
 - no session or login handling, so anything behind a login is out of reach
 - the injection checks are shallow: one login payload and one reflected marker. they can show a problem exists, they cannot show a target is clean
-- http only, no browser, so most client side issues are out of reach. the open redirect check only sees server side redirects
+- no browser, so most client side issues are out of reach. `reflected_xss` can only judge reflection, not whether a page actually executes it, and `open_redirect` only sees server side redirects
+- redirects are never followed at all, which is deliberate. a target that only exposes a problem behind a redirect, such as a login page at a new path, is not tested
+- `needs_review` is a judgement call made by the check, not by a person at run time. it means "the evidence does not demonstrate this", which is not the same as "this is probably fine"
+- `cors_policy` only asks the main page, so it cannot tell whether a credentialed api endpoint is readable. it says so in the result
 - checks run one at a time on purpose, so the request budget stays honest and the target is not hammered
 - the run executes in a thread inside the api process, so stopping the api kills a run in progress
 - starting two runs at the same time works (each has its own budget) but both hit the same target
 - the model summary can be vague or wrong. that is exactly why the result column never comes from the model
 - the reasons in the plan table are model commentary, not evidence. against juice shop the model wrote things like "juice shop is famous for accepting well-known demo credentials", which is prior knowledge of a well known target rather than something the recon showed. treat the plan as the agent explaining itself, not as a finding
 - `LAB_CREDENTIALS` defaults to public juice shop demo logins, so `weak_credentials` is not meaningful against a different target unless you change that list
+- the test certificates expire in 10 years. after that the https tests fail with a verification error and `backend/tests/certs/README.md` explains how to regenerate them
 
 ## not built yet
 
@@ -252,14 +330,14 @@ backend/
   app.py         fastapi endpoints
   cli.py         run a test from the terminal
   config.py      .env loading and defaults
-  scope.py       the only place that builds a request url, plus the budget and delay
+  scope.py       the only place that builds a request url, plus the budget, the delay, the tls ca and the error types
   catalogue.py   the explicit check list with severities and fallback fixes
-  checks.py      the http checks and the pass or fail decisions
+  checks.py      the http checks, the result vocabulary and the pass or fail decisions
   runner.py      recon, planning, execution, findings, report
   agent.py       the three deepseek calls
   db.py          sqlite schema and queries
   report.py      markdown report
-  tests/         pytest, with the fake target
+  tests/         pytest, with the fake target, the behaviour matrix and the test certificates
 frontend/        react + typescript + vite dashboard
   src/api.ts     the fetch calls the pages use
   src/theme.ts   severity and result colours and ordering
@@ -278,7 +356,10 @@ reports/         markdown report per run (gitignored)
 - a "scanner" is really a pile of small explicit http checks with a written down decision rule for each one. most of the work is deciding what counts as a result
 - evidence has to be written before a finding exists, otherwise the report makes claims the run cannot back up
 - a false positive is usually a wrong assumption about the framework, not a bug. the single page app fallback answering 200 for `/admin` is the example that bit me here
-- testing a security tool without a vulnerable target needs a fake target with a bad mode and a good mode, otherwise you only ever test the failing branch
+- a check's result is a claim, and the claim has to match the evidence. splitting "the response shows this" from "the response is consistent with this" removed more over-claiming than any amount of threshold tuning, and it made three checks report more, not less, because trace answering 200 and robots.txt listing a path really are demonstrated
+- a request budget that is only incremented after a response is not a budget. timeouts and refused connections were free, which is the opposite of what you want when the target is misbehaving
+- one ordering detail cost me a confusing failure: `requests.exceptions.ConnectTimeout` inherits from both `ConnectionError` and `Timeout`, so whichever you catch first decides whether a refused host is described as unreachable or slow
+- testing a security tool without a vulnerable target needs a fake target with a bad mode and a good mode, and single switches per behaviour, otherwise you only ever test the failing branch
 - sqlite needed WAL because a worker thread writes results while the dashboard polls the same file
 
 ## notes for anyone reading the code
