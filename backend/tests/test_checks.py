@@ -23,6 +23,33 @@ def make_config(target, tmp_path, **overrides):
     return load_config(settings)
 
 
+def canned_recon(origin, https=False, **profile_overrides):
+    """a recon result that skips the network, for tests that only care about a later step."""
+    profile = {
+        "root_status": 200,
+        "root_content_type": "application/json",
+        "unknown_path_status": 404,
+        "unknown_path_returns_app_shell": False,
+        "allow_header": "GET, OPTIONS, HEAD",
+        "head_status": 200,
+        "application_shape": "json_api",
+        "login_shape": "json",
+        "login_form": None,
+        "login_probe": {
+            "path": "/rest/user/login",
+            "source": "configured",
+            "status": 401,
+            "content_type": "application/json",
+            "json_response": True,
+            "accepted": False,
+        },
+        "search_endpoint": {"path": "/rest/products/search", "status": 200, "present": True},
+        "untrusted": {"title": "", "server_header": "", "powered_by": ""},
+    }
+    profile.update(profile_overrides)
+    return {"target": origin, "https": https, "profile": profile}
+
+
 def run_checks(target, cfg, only=None):
     run_id = run_pipeline(target.origin, "test run", cfg, only_checks=only or catalogue_ids())
     results = {row["check_id"]: row for row in db.get_check_results(cfg["db_path"], run_id)}
