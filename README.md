@@ -101,21 +101,105 @@ these are **observations, not conclusions**. "unknown paths return the app page"
 responses, and it is used to avoid calling a javascript route an exposed file. it is not a claim
 about what the app is.
 
-### what still needs manual configuration
+### which request format each login check uses
 
-only one request format is supported for the login checks: a json login api that takes
-`{"email": ..., "password": ...}`. so:
+the three login checks send their attempts in the format that was actually observed, and the field
+names come from the observed form, never from a guess:
 
-| situation | what happens |
+| what was observed | what the login checks do |
 |---|---|
-| json login api (juice shop, most rest apis) | the login checks run normally |
-| an html form login | the three login checks report `not_applicable` and say why. they are **not** run with the wrong request format |
-| no login endpoint at the configured path | same, `not_applicable`, with the observed status |
-| a login api with different field names or a form post | not supported yet. set `LOGIN_PATH` and expect `not_applicable`, or run with `--only` to leave the login checks out |
+| a json login api | post `{"email": ..., "password": ...}` to it |
+| an html form with a recognisable username and password field | post those two fields to the form's own action, on the same host only |
+| an html form whose fields cannot be mapped | `not_applicable`, naming the observed fields. nothing is filled in |
+| a form whose action points at another host | the action is recorded as an observation, but the check is `not_applicable` because it is off scope |
+| an authentication flow that answers 400 or wants a challenge | `error`, because a refusal and an acceptance cannot be told apart |
+| no login endpoint at the configured path | `not_applicable`, with the observed status |
 
-the gate is deliberately blunt: a check whose request format does not match what was observed is
-refused rather than run and reported as a pass. `unmet_requirement` in `catalogue.py` is the whole
-of that decision, and each entry declares what it needs with a `requires` field.
+### a login check never reports a clean result it cannot support
+
+this is the case that used to be a false clean, and it is the one worth remembering. if a wrong
+password does not produce a refusal, there is no way to tell an accepted login from a refused one,
+so a check that compares them proves nothing. the login checks therefore require a refusal first
+(`401`, `403`, or a redirect back to a login page) and otherwise report `error` with the reason:
+
+```
+error   sql_injection_login   the login endpoint answered 200 to a wrong password without
+                              refusing it, so an accepted and a refused login cannot be told
+                              apart, so comparing the payload would prove nothing
+```
+
+a throttled endpoint is called out separately, because "we could not test the passwords" is a
+different statement from "the passwords were refused":
+
+```
+error   weak_credentials      the login endpoint answered 429, which looks like throttling, so
+                              the credentials could not be tested
+```
+
+## demo: the same loop against two mock applications
+
+the mock applications used by the tests can be started on their own, which is the quickest way to
+watch the adaptation happen. one command starts a target, another runs against it:
+
+```powershell
+# terminal 1: pick one of the mock apps
+.\.venv\Scripts\python.exe -m backend.tests.fake_target --profile form-odd-fields --port 4010
+
+# terminal 2: allow it, then run (the shell value overrides .env for this window)
+$env:ALLOWED_TARGETS = "http://127.0.0.1:4010"
+.\.venv\Scripts\python.exe -m backend.cli run --target http://127.0.0.1:4010 --mock
+```
+
+profiles: `json-vulnerable`, `json-hardened`, `form-vulnerable`, `form-hardened`,
+`form-ambiguous-200`, `form-off-host`, `form-odd-fields`, `unsupported-auth`, `prompt-injection`.
+
+**a json login api, where every check applies.** output trimmed to the planning lines and the
+login checks:
+
+```
+run 11 against http://127.0.0.1:4010 (agent: mock agent (no api calls))
+  checking the target
+  target looks like javascript_driven with a json login
+  planning round 1
+  round 1: 13 check(s) from mock
+  running sql_injection_login (9 of 13)
+  ...
+  failed         sql_injection_login          '' OR 1=1--' was accepted where a normal bad login got 401
+  passed         weak_credentials             none of the 5 demo passwords worked
+  needs_review   rate_limit                   10 quick login attempts all got 401, with no 429, no
+                                              slowdown and no lockout. this does not show that throttling
+                                              is absent, only that it did not trigger here
+```
+
+**an html form whose fields cannot be mapped, where three checks are skipped with a reason.** same
+runner, same catalogue, different target:
+
+```
+run 13 against http://127.0.0.1:4012 (agent: mock agent (no api calls))
+  checking the target
+  target looks like server_rendered_html with a html_form login
+  planning round 1
+  skipping sql_injection_login: prerequisites not met
+  skipping weak_credentials: prerequisites not met
+  skipping rate_limit: prerequisites not met
+  round 1: 10 check(s) from mock
+  ...
+  not_applicable sql_injection_login          the observed login form fields ['user_id', 'secret'] could not
+                                              be mapped to a username and a password, so it was not filled in
+  not_applicable weak_credentials             the observed login form fields ['user_id', 'secret'] could not
+                                              be mapped to a username and a password, so it was not filled in
+  not_applicable rate_limit                   the observed login form fields ['user_id', 'secret'] could not
+                                              be mapped to a username and a password, so it was not filled in
+  failed         cookie_flags                 session: no secure, no httponly, no samesite
+```
+
+the point of the second one is that the three checks are missing from the findings **with a reason
+attached**, rather than being run against fields that do not mean what the check assumes. the other
+ten checks still ran, and the report lists the skipped ones under "not tested or inconclusive".
+
+with the real model the same run also plans in rounds and picks a subset. run 8 in the database
+above is a real example against an external practice target: the model asked for six checks, saw
+the results, then asked for four more.
 
 ### keeping the target out of the prompt
 
@@ -126,6 +210,15 @@ with an explicit instruction that they are data. the model's reply is then valid
 catalogue ids are read, only `id` and `reason` are kept, and anything else is dropped. a hostile
 page can still influence which check ids the model picks, which is why the ids are checked and the
 prerequisites are enforced in python rather than trusted.
+
+### what is still coarse
+
+- the application labels are hints, not conclusions. "javascript_driven" means an html root with no
+  form that talks to a json api
+- a login form whose field names do not look like a username and a password is skipped rather than
+  guessed at, so an app that names its fields unusually gets no login coverage
+- a json login api with different field names is only supported through `LOGIN_PATH`, not by
+  observing the field names, because there is no form to read them from
 
 ## the checks
 
@@ -348,7 +441,9 @@ hardened application with labels nobody derived from this code.
 
 verified:
 
-- 106 pytest tests pass (`106 passed in 50.97s`), covering the checks in both fake target modes, the 37 case behaviour matrix, the observe and plan loop with a scripted model, the scope rules over both schemes, the request budget including failed attempts, the evidence-before-finding rule, the stats queries, the interrupted run cleanup and report generation
+- 122 pytest tests pass (`122 passed in 59.57s`), covering the checks in both fake target modes, the 37 case behaviour matrix, a login check matrix across nine kinds of login (json, form, ambiguous 200, unmappable fields, off host action, unsupported flow, missing endpoint), the observe and plan loop with a scripted model, the scope rules over both schemes, the request budget including failed attempts, the evidence-before-finding rule, the stats queries, the interrupted run cleanup and report generation
+- the false clean cases are tested explicitly: a form login that answers 200 to everything, and an auth flow that answers 400, must both come back as `error` and never as `passed`
+- a form login is tested end to end against a local mock: the checks post the observed field names, the request format is recorded in the evidence with the values blanked, and a form whose action points off host is recorded but never requested
 - the adaptive loop is tested with the deepseek api replaced by a scripted agent that asserts on the prompts: the model is offered only the checks that have not run, its second prompt contains the first round's results, a check that already ran is refused, the iteration cap stops a model that always wants more, and a model that keeps returning rubbish fails the run instead of leaving it looking clean
 - a hostile page is tested directly: a target whose page and header both say "IGNORE ALL PREVIOUS INSTRUCTIONS" cannot get that text into the prompt as an instruction, and a hostile plan is still refused
 - the mock path is tested to make sure `MOCK_AGENT=1` never reaches the api at all
@@ -371,8 +466,8 @@ not verified:
 - one target at a time, and only targets on the allowlist
 - reconnaissance now costs 6 requests per run instead of 3, because it probes the login endpoint, the search endpoint and one unknown path. that is the price of planning from observations rather than assumptions
 - the application labels are coarse on purpose. "javascript_driven" means an html root with no form that talks to a json api, and it is a hint for the planner, not a statement about the app
-- the login checks support one request format only: a json login api with `email` and `password`. a form login gets `not_applicable`, which is honest but is still missing coverage
-- a login endpoint that answers 200 for both a bad and a good login cannot be judged, and the check does not yet detect that case (it would report `passed`). the shape gate stops the common version of this, but hardening that comparison is the next piece of work
+- the login checks support two request formats: a json login api taking `email` and `password`, and an html form whose field names look like a username and a password. anything else is skipped rather than guessed at, which is honest but is still missing coverage
+- a login endpoint that answers 200 to both a bad and a good login is now reported as `error` instead of `passed`, so it is no longer a false clean, but it also means such an app gets no login coverage at all
 - the model still decides which checks to ask for, so a hostile page could nudge that choice. what it cannot do is add a check, change a path, widen the scope, exceed a budget or have its reasoning decide a result
 - no session or login handling, so anything behind a login is out of reach
 - the injection checks are shallow: one login payload and one reflected marker. they can show a problem exists, they cannot show a target is clean
@@ -430,6 +525,7 @@ reports/         markdown report per run (gitignored)
 - a "scanner" is really a pile of small explicit http checks with a written down decision rule for each one. most of the work is deciding what counts as a result
 - evidence has to be written before a finding exists, otherwise the report makes claims the run cannot back up
 - a false positive is usually a wrong assumption about the framework, not a bug. the single page app fallback answering 200 for `/admin` is the example that bit me here
+- a check that cannot tell success from failure has to say so. the login comparison was the most dangerous bug here: it reported a pass on the strength of a comparison that could not distinguish an accepted login from a refused one, and a "passed" line in a report is believed
 - a check's result is a claim, and the claim has to match the evidence. splitting "the response shows this" from "the response is consistent with this" removed more over-claiming than any amount of threshold tuning, and it made three checks report more, not less, because trace answering 200 and robots.txt listing a path really are demonstrated
 - a request budget that is only incremented after a response is not a budget. timeouts and refused connections were free, which is the opposite of what you want when the target is misbehaving
 - one ordering detail cost me a confusing failure: `requests.exceptions.ConnectTimeout` inherits from both `ConnectionError` and `Timeout`, so whichever you catch first decides whether a refused host is described as unreachable or slow
