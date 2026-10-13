@@ -30,3 +30,8 @@ reports/
 # local run output
 server.log
 *.log
+
+# scratch files from generating the test certificates
+backend/tests/certs/ca.srl
+backend/tests/certs/*.csr
+backend/tests/certs/ca-key.pem

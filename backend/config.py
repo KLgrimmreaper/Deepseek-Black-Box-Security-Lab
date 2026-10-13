@@ -29,6 +29,15 @@ def _list(name, default):
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def _ca_bundle():
+    # only used for a lab target with a self signed certificate. empty means the system trust store
+    value = os.getenv("CA_BUNDLE", "").strip()
+    if not value:
+        return ""
+    path = Path(value)
+    return str(path if path.is_absolute() else BASE_DIR / path)
+
+
 def load_config(overrides=None):
     config = {
         "allowed_targets": _list("ALLOWED_TARGETS", ["http://localhost:3000"]),
@@ -37,6 +46,7 @@ def load_config(overrides=None):
         "max_requests_per_run": _int("MAX_REQUESTS_PER_RUN", 120),
         "request_delay_ms": _int("REQUEST_DELAY_MS", 200),
         "request_timeout": _int("REQUEST_TIMEOUT", 10),
+        "ca_bundle": _ca_bundle(),
         "mock_agent": os.getenv("MOCK_AGENT", "0").strip() == "1",
         "login_path": os.getenv("LOGIN_PATH", "/rest/user/login").strip(),
         "search_path": os.getenv("SEARCH_PATH", "/rest/products/search").strip(),
