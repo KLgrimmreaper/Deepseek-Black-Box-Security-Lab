@@ -57,15 +57,26 @@ def http_evidence(response, limit=2000):
     }
 
 
+SECRET_FIELDS = ("token", "password", "access_token", "authorization")
+
+
 def response_summary(response):
-    # for the login checks: the body can contain a session token, and evidence files
-    # should not become a place where working credentials get stored
+    # for the login checks: the body is kept so the evidence can be checked, but the value of
+    # anything that looks like a token or a password is blanked out first
     return {
         "request": {"method": response.request.method, "url": response.request.url},
         "status": response.status_code,
         "headers": dict(response.headers),
-        "body": "[not stored for this check, the login response can contain a session token]",
+        "body": redacted_body(response),
+        "body_note": "token and password values are replaced with [redacted], everything else is unchanged",
     }
+
+
+def redacted_body(response, limit=1200):
+    text = body_snippet(response, limit)
+    for field in SECRET_FIELDS:
+        text = re.sub(rf'("{field}"\s*:\s*)"[^"]*"', rf'\1"[redacted]"', text, flags=re.IGNORECASE)
+    return text
 
 
 def set_cookie_values(response):
