@@ -1,4 +1,4 @@
-import type { CatalogueEntry, Health, Run, RunDetail } from "./types";
+import type { CatalogueEntry, Finding, Health, Run, RunDetail, Stats } from "./types";
 
 const BASE = "/api";
 
@@ -23,8 +23,16 @@ export function getHealth(): Promise<Health> {
   return request<Health>("/health");
 }
 
+export function getStats(): Promise<Stats> {
+  return request<Stats>("/stats");
+}
+
 export function getChecks(): Promise<{ checks: CatalogueEntry[] }> {
   return request<{ checks: CatalogueEntry[] }>("/checks");
+}
+
+export function getFindings(): Promise<{ findings: Finding[] }> {
+  return request<{ findings: Finding[] }>("/findings");
 }
 
 export function getRuns(): Promise<{ runs: Run[] }> {

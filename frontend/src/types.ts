@@ -28,6 +28,7 @@ export type CheckResult = {
 
 export type Finding = {
   id: number;
+  run_id: number;
   check_id: string;
   title: string;
   severity: string;
@@ -37,6 +38,8 @@ export type Finding = {
   impact: string;
   remediation: string;
   model_generated: number;
+  target?: string;
+  started_at?: string;
 };
 
 export type Plan = {
@@ -69,4 +72,24 @@ export type CatalogueEntry = {
   severity: string;
   description: string;
   fix: string;
+};
+
+export type Counter = {
+  label: string;
+  value: number;
+};
+
+export type Stats = {
+  totals: {
+    runs: number;
+    finished: number;
+    failed: number;
+    checks_run: number;
+    findings: number;
+    requests: number;
+  };
+  by_severity: Counter[];
+  by_result: Counter[];
+  top_failing_checks: Counter[];
+  trend: Counter[];
 };

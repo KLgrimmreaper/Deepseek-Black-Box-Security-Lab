@@ -37,11 +37,7 @@ export default function FindingCard({ finding, runId }: Props) {
       <p>
         <strong>remediation:</strong> {finding.remediation}
       </p>
-      <p className="hint">
-        {finding.model_generated
-          ? "impact and remediation written by the model"
-          : "impact and remediation taken from the catalogue, the model did not write them"}
-      </p>
+      {finding.model_generated === 1 && <p className="hint">impact and remediation written by the model</p>}
       <p className="hint">
         evidence: <code>{finding.evidence_path}</code>
       </p>
