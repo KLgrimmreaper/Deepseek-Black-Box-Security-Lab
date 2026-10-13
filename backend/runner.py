@@ -54,8 +54,15 @@ def _write_evidence(evidence_dir, check_id, payload):
         return path.as_posix()
 
 
-def _run_checks(run_id, target, cfg, only_checks):
-    db.set_run_stage(cfg["db_path"], run_id, "checking the target")
+def _run_checks(run_id, target, cfg, only_checks, on_progress=None):
+    def stage(message):
+        # the stage is stored so the dashboard can show it, and handed to the cli so a
+        # terminal run is not silent for two minutes
+        db.set_run_stage(cfg["db_path"], run_id, message)
+        if on_progress:
+            on_progress(message)
+
+    stage("checking the target")
     scope = Scope(
         target,
         cfg["allowed_targets"],
@@ -68,18 +75,21 @@ def _run_checks(run_id, target, cfg, only_checks):
     if only_checks:
         plan = agent.manual_plan(only_checks, cfg)
     else:
-        db.set_run_stage(cfg["db_path"], run_id, "asking the model which checks to run")
+        stage("planning the checks")
         plan = agent.plan_checks(recon, cfg)
     db.set_run_plan(cfg["db_path"], run_id, plan)
 
     evidence_dir = Path(cfg["evidence_dir"]) / str(run_id)
     evidence_dir.mkdir(parents=True, exist_ok=True)
 
+    if on_progress:
+        on_progress(f"planned {len(plan['checks'])} check(s) from {plan['source']}")
+
     candidates = []
     total = len(plan["checks"])
     for index, item in enumerate(plan["checks"], start=1):
         entry = CATALOGUE_BY_ID[item["id"]]
-        db.set_run_stage(cfg["db_path"], run_id, f"running {item['id']} ({index} of {total})")
+        stage(f"running {item['id']} ({index} of {total})")
         requests_before = scope.requests_sent
         try:
             outcome = checks.CHECKS[item["id"]](scope, cfg)
@@ -125,6 +135,9 @@ def _run_checks(run_id, target, cfg, only_checks):
                 }
             )
 
+    if candidates:
+        stage(f"writing up {len(candidates)} finding(s)")
+
     explanations = agent.explain_findings(
         [
             {
@@ -163,6 +176,8 @@ def _run_checks(run_id, target, cfg, only_checks):
     findings = db.get_findings(cfg["db_path"], run_id)
     summary = agent.summarise(scope.origin, results, len(findings), cfg)
 
+    if on_progress:
+        on_progress("writing the report")
     db.finish_run(
         cfg["db_path"], run_id,
         status="finished",
@@ -207,10 +222,10 @@ def create_run(target, notes, cfg):
     return db.create_run(cfg["db_path"], target, notes, model_label)
 
 
-def execute_run(run_id, target, cfg, only_checks=None):
+def execute_run(run_id, target, cfg, only_checks=None, on_progress=None):
     # errors are recorded on the run instead of raised, so a broken run still shows up in the dashboard
     try:
-        _run_checks(run_id, target, cfg, only_checks)
+        _run_checks(run_id, target, cfg, only_checks, on_progress)
     except (ScopeError, agent.AgentError) as exc:
         _fail(cfg, run_id, str(exc))
     except Exception as exc:
@@ -218,6 +233,6 @@ def execute_run(run_id, target, cfg, only_checks=None):
     return run_id
 
 
-def run_pipeline(target, notes, cfg, only_checks=None):
+def run_pipeline(target, notes, cfg, only_checks=None, on_progress=None):
     run_id = create_run(target, notes, cfg)
-    return execute_run(run_id, target, cfg, only_checks)
+    return execute_run(run_id, target, cfg, only_checks, on_progress)

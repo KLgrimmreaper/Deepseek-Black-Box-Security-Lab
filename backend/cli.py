@@ -3,7 +3,7 @@ import argparse
 from . import db
 from .catalogue import CATALOGUE
 from .config import load_config
-from .runner import run_pipeline
+from .runner import create_run, execute_run
 
 
 def print_run(run_id, cfg):
@@ -53,7 +53,10 @@ def main():
         print("no target given and ALLOWED_TARGETS is empty")
         return
     only = [item.strip() for item in args.only.split(",") if item.strip()]
-    run_id = run_pipeline(target, args.notes, cfg, only_checks=only or None)
+    run_id = create_run(target, args.notes, cfg)
+    print(f"run {run_id} against {target} (agent: {db.get_run(cfg['db_path'], run_id)['model']})")
+    # a run takes a minute or two, so the stage is printed as it changes instead of at the end
+    execute_run(run_id, target, cfg, only_checks=only or None, on_progress=lambda stage: print(f"  {stage}", flush=True))
     print_run(run_id, cfg)
 
 
