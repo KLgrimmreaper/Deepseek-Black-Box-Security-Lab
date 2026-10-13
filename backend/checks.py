@@ -3,7 +3,7 @@ import secrets
 from hashlib import sha256
 from urllib.parse import quote
 
-from .scope import body_snippet, lower_headers
+from .scope import ScopeError, body_snippet, lower_headers
 
 # every check returns a dict with:
 #   result: failed | needs_review | passed | not_applicable | error
@@ -63,6 +63,61 @@ REDIRECT_PARAMS = ["/?to=", "/?next=", "/redirect?url="]
 # a cookie whose name suggests a session is judged as one, other cookies are only observations
 SESSION_COOKIE_HINTS = ("session", "sess", "sid", "token", "auth", "jwt", "remember", "login")
 
+# paths and words that point at an authentication page
+LOGIN_HINTS = ("login", "log-in", "signin", "sign-in", "signon", "auth")
+
+# words a page shows after a successful form login, used only when the answer is a page
+FORM_SUCCESS_HINTS = ("logout", "log out", "sign out", "dashboard")
+
+
+def form_field_names(form):
+    """picks the username and password fields out of the names that were actually observed.
+
+    it recognises names, it never guesses one. a form whose fields do not look like a username
+    and a password is refused, so credentials are never posted into the wrong field.
+    """
+    names = [str(name) for name in ((form or {}).get("fields") or [])]
+    password = next((name for name in names if "pass" in name.lower()), "")
+    username = next(
+        (
+            name
+            for name in names
+            if name != password and any(hint in name.lower() for hint in ("user", "email", "login", "name"))
+        ),
+        "",
+    )
+    if not username or not password:
+        return None
+    return username, password
+
+
+def login_mode(cfg):
+    """which request format the observed login endpoint speaks."""
+    profile = cfg.get("profile") or {}
+    return "form" if profile.get("login_shape") == "html_form" else "json"
+
+
+def login_path(cfg):
+    profile = cfg.get("profile") or {}
+    if login_mode(cfg) == "form":
+        return (profile.get("login_form") or {}).get("path") or cfg["login_path"]
+    return cfg["login_path"]
+
+
+def login_attempt(scope, cfg, username, password):
+    """one login attempt, sent in the format that was observed on this target.
+
+    the only things taken from the target are the request format and the field names, both of
+    which came from recon. the username and the password are always ours.
+    """
+    if login_mode(cfg) == "form":
+        mapping = form_field_names((cfg.get("profile") or {}).get("login_form"))
+        if mapping is None:
+            raise ScopeError("the observed login form fields could not be mapped to a username and a password")
+        username_field, password_field = mapping
+        return scope.post(login_path(cfg), data={username_field: username, password_field: password})
+    return scope.post(login_path(cfg), json={"email": username, "password": password})
+
 
 def http_evidence(response, limit=2000):
     return {
@@ -76,11 +131,26 @@ def http_evidence(response, limit=2000):
 SECRET_FIELDS = ("token", "password", "access_token", "authorization")
 
 
+def posted_fields(response):
+    """the names of the form fields that were posted, with every value blanked out.
+
+    a form mode finding has to show how the login was sent, and the field names are what makes
+    it checkable. the values are never stored.
+    """
+    body = response.request.body
+    if not isinstance(body, str) or not body:
+        return ""
+    if body.lstrip().startswith("{"):
+        return "[json body, values not stored]"
+    return "&".join(f"{part.partition('=')[0]}=[sent]" for part in body.split("&") if part)
+
+
 def response_summary(response):
     # for the login checks: the body is kept so the evidence can be checked, but the value of
     # anything that looks like a token or a password is blanked out first
     return {
         "request": {"method": response.request.method, "url": response.request.url},
+        "posted_fields": posted_fields(response),
         "status": response.status_code,
         "headers": dict(response.headers),
         "body": redacted_body(response),
@@ -103,11 +173,48 @@ def set_cookie_values(response):
         return [value] if value else []
 
 
-def looks_authenticated(response):
+def looks_authenticated(response, form_mode=False):
+    if form_mode:
+        if response.status_code in (301, 302, 303, 307, 308):
+            # a form login that worked usually redirects away from the login page
+            location = (response.headers.get("Location") or "").lower()
+            return not any(hint in location for hint in LOGIN_HINTS)
+        if response.status_code == 200:
+            body = response.text.lower()
+            return any(hint in body for hint in FORM_SUCCESS_HINTS)
+        return False
     if response.status_code != 200:
         return False
     body = response.text.lower()
     return any(key in body for key in ("token", "authenticated", "access_token", "sessionid"))
+
+
+def looks_rejected(response):
+    """did the login endpoint refuse these credentials in a way we can compare against?
+
+    this is what stops a false clean. when a wrong password does not produce a refusal, an
+    accepted login and a refused one cannot be told apart, and a check that compares them
+    proves nothing.
+    """
+    if response.status_code in (401, 403):
+        return True
+    if response.status_code in (301, 302, 303, 307, 308):
+        location = (response.headers.get("Location") or "").lower()
+        return any(hint in location for hint in LOGIN_HINTS)
+    return False
+
+
+def no_refusal_reason(response):
+    """why a login comparison cannot be trusted, for a response that did not refuse."""
+    if response.status_code in (429, 503):
+        return (
+            f"the login endpoint answered {response.status_code}, which looks like throttling, so the "
+            "credentials could not be tested"
+        )
+    return (
+        f"the login endpoint answered {response.status_code} to a wrong password without refusing it, so an "
+        "accepted and a refused login cannot be told apart"
+    )
 
 
 def search_url(cfg, value):
@@ -156,15 +263,21 @@ def check_server_info_disclosure(scope, cfg):
 
 
 def check_cookie_flags(scope, cfg):
-    responses = [
-        scope.get("/"),
-        scope.post(cfg["login_path"], json={"email": "nobody@example.com", "password": "not-the-password"}),
-    ]
+    responses = [scope.get("/")]
+    login_note = ""
+    try:
+        # the login response often sets the session cookie, but a cookie check does not need to
+        # log in, so a login that cannot be sent is recorded as a note rather than a failure
+        responses.append(login_attempt(scope, cfg, "nobody@example.com", "not-the-password"))
+    except ScopeError as exc:
+        login_note = str(exc)
     cookies = []
     for response in responses:
         for raw in set_cookie_values(response):
             cookies.append({"url": response.request.url, "cookie": raw})
     evidence = {"responses": [response_summary(r) for r in responses], "set_cookie": cookies}
+    if login_note:
+        evidence["login_response"] = f"not probed: {login_note}"
     if not cookies:
         return {
             "result": "not_applicable",
@@ -373,18 +486,20 @@ def check_error_disclosure(scope, cfg):
 
 
 def check_sql_injection_login(scope, cfg):
-    baseline = scope.post(
-        cfg["login_path"],
-        json={"email": f"nobody{secrets.token_hex(3)}@example.com", "password": "not-the-password"},
-    )
-    attempt = scope.post(cfg["login_path"], json={"email": SQLI_EMAIL, "password": "not-the-password"})
-    baseline_ok = looks_authenticated(baseline)
-    attempt_ok = looks_authenticated(attempt)
+    form = login_mode(cfg) == "form"
+    baseline = login_attempt(scope, cfg, f"nobody{secrets.token_hex(3)}@example.com", "not-the-password")
+    attempt = login_attempt(scope, cfg, SQLI_EMAIL, "not-the-password")
+    baseline_ok = looks_authenticated(baseline, form)
+    attempt_ok = looks_authenticated(attempt, form)
+    baseline_rejected = looks_rejected(baseline)
     evidence = {
+        "request_format": "form" if form else "json",
+        "login_path": login_path(cfg),
         "baseline": response_summary(baseline),
         "payload": {"email": SQLI_EMAIL, "password": "not-the-password"},
         "payload_response": response_summary(attempt),
         "baseline_authenticated": baseline_ok,
+        "baseline_rejected": baseline_rejected,
         "payload_authenticated": attempt_ok,
     }
     if baseline.status_code in (404, 405, 501):
@@ -399,6 +514,14 @@ def check_sql_injection_login(scope, cfg):
             "detail": "the baseline login with a random email was accepted, so the payload result means nothing",
             "evidence": evidence,
         }
+    if not baseline_rejected:
+        # the endpoint answered a wrong password without refusing it, so there is nothing to
+        # compare against and a "pass" here would be a false clean
+        return {
+            "result": "error",
+            "detail": no_refusal_reason(baseline) + ", so comparing the payload would prove nothing",
+            "evidence": evidence,
+        }
     if attempt_ok:
         return {
             "result": "failed",
@@ -407,7 +530,7 @@ def check_sql_injection_login(scope, cfg):
         }
     return {
         "result": "passed",
-        "detail": f"the payload got {attempt.status_code}, the same as a normal bad login",
+        "detail": f"the payload was refused the same way a wrong password was ({attempt.status_code})",
         "evidence": evidence,
     }
 
@@ -471,27 +594,52 @@ def check_open_redirect(scope, cfg):
 
 
 def check_weak_credentials(scope, cfg):
+    form = login_mode(cfg) == "form"
+    # one definitely wrong login first, because "none of the passwords worked" only means
+    # something if the endpoint actually refuses a wrong password
+    baseline = login_attempt(
+        scope, cfg, f"nobody{secrets.token_hex(3)}@example.com", "definitely-not-the-password"
+    )
     attempts = []
     accepted = None
     for entry in cfg["credentials"]:
         email, _, password = entry.partition(":")
-        response = scope.post(cfg["login_path"], json={"email": email, "password": password})
-        ok = looks_authenticated(response)
+        response = login_attempt(scope, cfg, email, password)
+        ok = looks_authenticated(response, form)
         attempts.append({"email": email, "status": response.status_code, "accepted": ok})
         if ok:
             accepted = email
             break
-    evidence = {"attempts": attempts, "accepted": accepted}
+    evidence = {
+        "request_format": "form" if form else "json",
+        "login_path": login_path(cfg),
+        "baseline": response_summary(baseline),
+        "baseline_rejected": looks_rejected(baseline),
+        "attempts": attempts,
+        "accepted": accepted,
+    }
+    if baseline.status_code in (404, 405, 501):
+        return {
+            "result": "error",
+            "detail": f"the login endpoint answered {baseline.status_code}, check LOGIN_PATH in .env",
+            "evidence": evidence,
+        }
+    if looks_authenticated(baseline, form):
+        return {
+            "result": "error",
+            "detail": "a login with a random email and a random password was accepted, so this check means nothing",
+            "evidence": evidence,
+        }
+    if not looks_rejected(baseline):
+        return {
+            "result": "error",
+            "detail": no_refusal_reason(baseline) + ", so trying the demo passwords would prove nothing",
+            "evidence": evidence,
+        }
     if accepted:
         return {
             "result": "failed",
             "detail": f"the login accepted {accepted} with a public demo password",
-            "evidence": evidence,
-        }
-    if all(item["status"] in (404, 405, 501) for item in attempts):
-        return {
-            "result": "error",
-            "detail": f"the login endpoint answered {attempts[0]['status']}, check LOGIN_PATH in .env",
             "evidence": evidence,
         }
     return {"result": "passed", "detail": f"none of the {len(attempts)} demo passwords worked", "evidence": evidence}
@@ -507,11 +655,11 @@ def check_rate_limit(scope, cfg):
     email = f"nobody{secrets.token_hex(3)}@example.com"
     attempt_log = []
     for _ in range(attempts):
-        response = scope.post(cfg["login_path"], json={"email": email, "password": "not-the-password"})
+        response = login_attempt(scope, cfg, email, "not-the-password")
         attempt_log.append({"status": response.status_code, "ms": scope.last_elapsed_ms})
 
     statuses = [item["status"] for item in attempt_log]
-    evidence = {"attempts": attempts, "attempt_log": attempt_log}
+    evidence = {"attempts": attempts, "attempt_log": attempt_log, "request_format": login_mode(cfg)}
 
     throttled = [item for item in attempt_log if item["status"] in (429, 503)]
     if throttled:
@@ -522,7 +670,7 @@ def check_rate_limit(scope, cfg):
             "evidence": evidence,
         }
 
-    if len(set(statuses)) > 1 and statuses[0] in (401, 403):
+    if len(set(statuses)) > 1 and statuses[0] in (200, 302, 401, 403):
         changed = next(item for item in attempt_log if item["status"] != statuses[0])
         return {
             "result": "needs_review",
@@ -542,7 +690,8 @@ def check_rate_limit(scope, cfg):
             "evidence": evidence,
         }
 
-    if any(status in (401, 403, 200) for status in statuses):
+    # 302 and 303 are in here because a form login answers a wrong password with a redirect
+    if any(status in (200, 301, 302, 303, 401, 403) for status in statuses):
         return {
             "result": "needs_review",
             "detail": f"{attempts} quick login attempts all got {statuses[0]}, with no 429, no slowdown and no "

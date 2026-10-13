@@ -106,6 +106,9 @@ def _run_checks(run_id, target, cfg, only_checks, on_progress=None):
 
     profile = recon["profile"]
     db.set_run_profile(cfg["db_path"], run_id, profile)
+    # the checks read the observed facts from here, so a login check knows which request format
+    # the target actually speaks and which field names its form uses
+    cfg["profile"] = profile
     if on_progress:
         on_progress(
             f"target looks like {profile['application_shape']} with a {profile['login_shape']} login"

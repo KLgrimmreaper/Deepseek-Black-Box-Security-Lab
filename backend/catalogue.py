@@ -14,6 +14,8 @@
 # check is never run against a request format it does not support. saying nothing means the
 # check works on any target.
 
+from .checks import form_field_names
+
 CATALOGUE = [
     {
         "id": "security_headers",
@@ -93,7 +95,7 @@ CATALOGUE = [
         "name": "sql injection in the login endpoint",
         "category": "injection",
         "severity": "high",
-        "requires": "login_json",
+        "requires": "login_usable",
         "description": "sends a normal failed login as a baseline and then the email payload ' OR 1=1-- and compares "
                        "the two responses",
         "fix": "use parameterised queries for the login lookup instead of building sql from the submitted values",
@@ -123,7 +125,7 @@ CATALOGUE = [
         "name": "public demo credentials accepted",
         "category": "authentication",
         "severity": "high",
-        "requires": "login_json",
+        "requires": "login_usable",
         "description": "tries a short list of well known demo account passwords against the login endpoint",
         "fix": "change the default accounts and remove the demo users from anything that is not a training lab",
     },
@@ -132,7 +134,7 @@ CATALOGUE = [
         "name": "no throttling on login attempts",
         "category": "authentication",
         "severity": "low",
-        "requires": "login_json",
+        "requires": "login_usable",
         "description": "sends 10 quick failed logins and reports throttling when it shows up as a 429, a lockout or "
                        "clearly slower answers. ten requests cannot show that throttling is absent, so a quiet run "
                        "is only an observation",
@@ -160,14 +162,21 @@ def unmet_requirement(entry, profile):
     if not need:
         return None
 
-    if need == "login_json":
+    if need == "login_usable":
         shape = profile.get("login_shape")
         if shape == "json":
             return None
         if shape == "html_form":
-            return ("the login page is an html form and the login checks only speak the json login "
-                    "api, so this was not run")
-        return f"no json login endpoint was observed (login shape: {shape})"
+            form = profile.get("login_form") or {}
+            if not form.get("same_origin", True):
+                return "the login form posts its credentials to another host, so it was not used"
+            if not form.get("path"):
+                return "the observed login form has no usable action, so it was not used"
+            if form_field_names(form) is None:
+                return (f"the observed login form fields {form.get('fields')} could not be mapped to a username "
+                        "and a password, so it was not filled in")
+            return None
+        return f"no usable login endpoint was observed (login shape: {shape})"
 
     if need == "search_endpoint":
         search = profile.get("search_endpoint") or {}

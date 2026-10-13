@@ -8,12 +8,10 @@ instructions to the model through its own content.
 import secrets
 from hashlib import sha256
 from html.parser import HTMLParser
+from urllib.parse import urljoin, urlparse
 
-from .checks import looks_authenticated, search_url
+from .checks import LOGIN_HINTS, looks_authenticated, search_url
 from .scope import ScopeError, body_snippet, lower_headers
-
-# links that usually lead to an authentication page
-LOGIN_HINTS = ("login", "log-in", "signin", "sign-in", "signon", "auth")
 
 # a path that very likely does not exist, used to see how the app answers unknown routes
 UNKNOWN_PATH_PREFIX = "dsh-not-a-real-path-"
@@ -143,25 +141,35 @@ def collect_recon(scope, cfg):
                     linked_login = ""
 
     if form is not None:
-        login_path = form["action"] or linked_login or "/"
-        login_source = "form"
+        # the action is resolved against the target and kept only if it stays on the same host.
+        # a form that posts its credentials somewhere else is recorded but never used
+        action = form["action"] or linked_login or "/"
+        resolved = urljoin(scope.origin + "/", action.lstrip("/"))
+        same_origin = urlparse(resolved).netloc == urlparse(scope.origin).netloc
+        login_form = {
+            "action": _clean(form["action"]),
+            "path": resolved if same_origin else "",
+            "same_origin": same_origin,
+            "method": form["method"],
+            "fields": [_clean(name) for name in form["fields"]],
+        }
     else:
-        login_path = cfg["login_path"]
-        login_source = "configured"
+        login_form = None
 
     # one failed login tells us the shape of the login response without needing credentials
     login_probe = None
-    if login_path:
+    probe_path = (login_form or {}).get("path") or cfg["login_path"]
+    if probe_path:
         try:
             response = scope.post(
-                login_path,
+                probe_path,
                 json={"email": f"nobody{secrets.token_hex(3)}@example.com", "password": "not-the-password"},
             )
         except ScopeError:
             raise
         login_probe = {
-            "path": login_path,
-            "source": login_source,
+            "path": probe_path,
+            "source": "form" if login_form else "configured",
             "status": response.status_code,
             "content_type": _clean(response.headers.get("Content-Type")),
             "json_response": _looks_like_json(response),
@@ -173,11 +181,12 @@ def collect_recon(scope, cfg):
     search_response = scope.get(search_url(cfg, "dshprobe"))
     search_status = search_response.status_code
 
-    if login_probe is None or login_probe["status"] in (404, 405, 501):
-        login_shape = "absent"
-    elif form is not None:
-        # a form on the page wins, because the login checks post json and a form will not read it
+    if login_form is not None:
+        # a form on the page is direct evidence of a form login, so it is checked before the
+        # probe result. the probe posts json and a form endpoint will not read that
         login_shape = "html_form"
+    elif login_probe is None or login_probe["status"] in (404, 405, 501):
+        login_shape = "absent"
     elif login_probe["status"] in (401, 403) or login_probe["json_response"]:
         # 401 or 403 to a json login attempt means the endpoint accepted the request format and
         # then judged the credentials, which is what a json login api does. juice shop answers a
@@ -196,11 +205,7 @@ def collect_recon(scope, cfg):
         "head_status": head.status_code,
         "application_shape": app_shape,
         "login_shape": login_shape,
-        "login_form": (
-            {"action": _clean(form["action"]), "method": form["method"], "fields": [_clean(f) for f in form["fields"]]}
-            if form
-            else None
-        ),
+        "login_form": login_form,
         "login_probe": login_probe,
         "search_endpoint": {"path": cfg["search_path"], "status": search_status, "present": search_status != 404},
         # these three are target authored text, kept short and clearly marked as untrusted
