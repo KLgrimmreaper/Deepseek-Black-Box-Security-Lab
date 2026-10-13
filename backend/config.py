@@ -52,6 +52,7 @@ def load_config(overrides=None):
         "search_path": os.getenv("SEARCH_PATH", "/rest/products/search").strip(),
         "credentials": _list("LAB_CREDENTIALS", DEFAULT_CREDENTIALS),
         "max_checks_per_run": _int("MAX_CHECKS_PER_RUN", 13),
+        "max_iterations": _int("MAX_ITERATIONS", 3),
         "rate_limit_attempts": _int("RATE_LIMIT_ATTEMPTS", 10),
         "db_path": BASE_DIR / "data" / "lab.db",
         "evidence_dir": BASE_DIR / "evidence",

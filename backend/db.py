@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS runs (
   summary TEXT NOT NULL DEFAULT '',
   summary_source TEXT NOT NULL DEFAULT '',
   planned_json TEXT NOT NULL DEFAULT '{}',
+  profile_json TEXT NOT NULL DEFAULT '{}',
   request_count INTEGER NOT NULL DEFAULT 0,
   error TEXT,
   started_at TEXT NOT NULL,
@@ -44,7 +45,8 @@ CREATE TABLE IF NOT EXISTS check_results (
   detail TEXT NOT NULL DEFAULT '',
   reason TEXT NOT NULL DEFAULT '',
   evidence_path TEXT,
-  requests_used INTEGER NOT NULL DEFAULT 0
+  requests_used INTEGER NOT NULL DEFAULT 0,
+  round INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS findings (
@@ -89,11 +91,16 @@ def init_db(db_path):
         # the api runs a test in a worker thread while the dashboard polls the same file
         conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript(SCHEMA)
-        # databases created before the pid column existed need it added in place, because
+        # databases created before these columns existed need them added in place, because
         # CREATE TABLE IF NOT EXISTS leaves an existing table alone
-        columns = {row["name"] for row in conn.execute("PRAGMA table_info(runs)")}
-        if "pid" not in columns:
-            conn.execute("ALTER TABLE runs ADD COLUMN pid INTEGER")
+        for table, column, kind in [
+            ("runs", "pid", "INTEGER"),
+            ("runs", "profile_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ("check_results", "round", "INTEGER NOT NULL DEFAULT 1"),
+        ]:
+            columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+            if column not in columns:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
 
 
 def _pid_alive(pid):
@@ -154,6 +161,11 @@ def set_run_plan(db_path, run_id, planned):
         conn.execute("UPDATE runs SET planned_json = ? WHERE id = ?", (json.dumps(planned), run_id))
 
 
+def set_run_profile(db_path, run_id, profile):
+    with db_connection(db_path) as conn:
+        conn.execute("UPDATE runs SET profile_json = ? WHERE id = ?", (json.dumps(profile), run_id))
+
+
 def finish_run(db_path, run_id, status, summary="", summary_source="", request_count=0, error=None):
     with db_connection(db_path) as conn:
         conn.execute(
@@ -164,12 +176,12 @@ def finish_run(db_path, run_id, status, summary="", summary_source="", request_c
 
 
 def add_check_result(db_path, run_id, check_id, name, severity, result, detail="", reason="",
-                     evidence_path=None, requests_used=0):
+                     evidence_path=None, requests_used=0, round_number=1):
     with db_connection(db_path) as conn:
         conn.execute(
             "INSERT INTO check_results (run_id, check_id, name, severity, result, detail, reason, evidence_path,"
-            " requests_used) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (run_id, check_id, name, severity, result, detail, reason, evidence_path, requests_used),
+            " requests_used, round) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (run_id, check_id, name, severity, result, detail, reason, evidence_path, requests_used, round_number),
         )
 
 

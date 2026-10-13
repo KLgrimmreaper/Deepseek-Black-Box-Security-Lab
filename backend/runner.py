@@ -5,9 +5,10 @@ from pathlib import Path
 import requests
 
 from . import agent, checks, db, report
-from .catalogue import CATALOGUE_BY_ID
+from .catalogue import CATALOGUE, CATALOGUE_BY_ID, unmet_requirement
 from .config import BASE_DIR
-from .scope import Scope, ScopeError, body_snippet
+from .recon import collect_recon
+from .scope import Scope, ScopeError
 
 # the two results that produce a finding. failed means the check demonstrated the condition,
 # needs_review means it only observed something consistent with it, and the finding keeps that
@@ -15,20 +16,30 @@ from .scope import Scope, ScopeError, body_snippet
 FINDING_RESULTS = ("failed", "needs_review")
 
 
-def collect_recon(scope):
-    base = scope.get("/")
-    options = scope.request("OPTIONS", "/")
-    head = scope.request("HEAD", "/")
-    observations = {
-        "root_status": base.status_code,
-        "root_content_type": base.headers.get("Content-Type", ""),
-        "server_header": base.headers.get("Server", ""),
-        "powered_by": base.headers.get("X-Powered-By", ""),
-        "allow_header": options.headers.get("Allow", ""),
-        "head_status": head.status_code,
-        "body_start": body_snippet(base, 300),
-    }
-    return {"target": scope.origin, "https": scope.is_https, "observations": observations}
+def _approve_plan(items, remaining, profile, cfg, already_run):
+    """the deterministic gate between the model and the network.
+
+    the model proposes catalogue ids, this decides which of them may actually run: the id has
+    to be in the catalogue, still available, inside the per run limit, and its prerequisites
+    have to have been observed on the target. anything else is refused here, in python.
+    """
+    approved = []
+    blocked = []
+    over_limit = []
+    room = max(0, cfg["max_checks_per_run"] - already_run)
+    for item in items:
+        check_id = item["id"]
+        if check_id not in remaining:
+            continue
+        if len(approved) >= room:
+            over_limit.append({"id": check_id, "reason": "over the per run check limit"})
+            continue
+        unmet = unmet_requirement(CATALOGUE_BY_ID[check_id], profile)
+        if unmet:
+            blocked.append({"id": check_id, "reason": unmet})
+            continue
+        approved.append(item)
+    return approved, blocked, over_limit
 
 
 def _evidence_excerpt(evidence, limit=600):
@@ -76,7 +87,7 @@ def _run_checks(run_id, target, cfg, only_checks, on_progress=None):
         ca_bundle=cfg["ca_bundle"],
     )
     try:
-        recon = collect_recon(scope)
+        recon = collect_recon(scope, cfg)
     except requests.exceptions.SSLError as exc:
         # a certificate problem is a connection problem, not a weakness in the target
         raise ScopeError(f"TLS certificate verification failed for {scope.origin}: {exc}") from exc
@@ -88,89 +99,159 @@ def _run_checks(run_id, target, cfg, only_checks, on_progress=None):
         raise ScopeError(
             f"{scope.origin} did not answer within {cfg['request_timeout']}s, so the run was stopped: {exc}"
         ) from exc
+    except ScopeError as exc:
+        raise ScopeError(
+            f"reconnaissance used up the request budget ({exc}), so raise MAX_REQUESTS_PER_RUN"
+        ) from exc
 
-    if only_checks:
-        plan = agent.manual_plan(only_checks, cfg)
-    else:
-        stage("planning the checks")
-        plan = agent.plan_checks(recon, cfg)
-    db.set_run_plan(cfg["db_path"], run_id, plan)
+    profile = recon["profile"]
+    db.set_run_profile(cfg["db_path"], run_id, profile)
+    if on_progress:
+        on_progress(
+            f"target looks like {profile['application_shape']} with a {profile['login_shape']} login"
+        )
 
     evidence_dir = Path(cfg["evidence_dir"]) / str(run_id)
     evidence_dir.mkdir(parents=True, exist_ok=True)
 
-    if on_progress:
-        on_progress(f"planned {len(plan['checks'])} check(s) from {plan['source']}")
-
     candidates = []
-    total = len(plan["checks"])
-    for index, item in enumerate(plan["checks"], start=1):
-        entry = CATALOGUE_BY_ID[item["id"]]
-        stage(f"running {item['id']} ({index} of {total})")
-        requests_before = scope.requests_sent
-        try:
-            outcome = checks.CHECKS[item["id"]](scope, cfg)
-        except ScopeError as exc:
-            outcome = {"result": "error", "detail": str(exc), "evidence": {"note": "the check did not complete"}}
-        except requests.exceptions.SSLError as exc:
-            outcome = {
-                "result": "error",
-                "detail": f"TLS certificate verification failed, so this check could not run: {exc}",
-                "evidence": {"note": "the request was refused by the local tls trust settings"},
-            }
-        except requests.exceptions.ConnectionError as exc:
-            outcome = {
-                "result": "error",
-                "detail": f"the connection failed, so this check could not run: {exc}",
-                "evidence": {"note": "the target could not be reached"},
-            }
-        except requests.exceptions.Timeout as exc:
-            # after ConnectionError, because ConnectTimeout is both
-            outcome = {
-                "result": "error",
-                "detail": f"the request timed out after {cfg['request_timeout']}s, so this check could not run: {exc}",
-                "evidence": {"note": "the target did not answer in time"},
-            }
-        except Exception as exc:
-            # one broken check should not throw away the results of the others
-            outcome = {
-                "result": "error",
-                "detail": f"{type(exc).__name__}: {exc}",
-                "evidence": {"traceback": traceback.format_exc()},
-            }
-        requests_used = scope.requests_sent - requests_before
+    results_so_far = []
+    rounds = []
+    skipped = []
+    remaining = [entry["id"] for entry in CATALOGUE]
+    checks_run = 0
+    round_number = 0
 
-        payload = {"target": scope.origin, "check": item["id"], "reason": item["reason"], **outcome["evidence"]}
-        evidence_path = _write_evidence(evidence_dir, item["id"], payload)
-        result = outcome["result"]
-        detail = outcome["detail"]
-        if result in FINDING_RESULTS and evidence_path is None:
-            # no evidence on disk means no finding, the run can only record that it failed to record
-            result = "error"
-            detail = f"{detail} (the evidence file could not be written, so no finding was created)"
+    while remaining and round_number < cfg["max_iterations"]:
+        if scope.requests_sent >= scope.max_requests:
+            if on_progress:
+                on_progress("request budget reached, stopping")
+            break
+        round_number += 1
 
-        db.add_check_result(
-            cfg["db_path"], run_id,
-            check_id=item["id"],
-            name=entry["name"],
-            severity=entry["severity"],
-            result=result,
-            detail=detail,
-            reason=item["reason"],
-            evidence_path=evidence_path,
-            requests_used=requests_used,
-        )
-        if result in FINDING_RESULTS:
-            candidates.append(
-                {
-                    "check_id": item["id"],
-                    "entry": entry,
-                    "result": result,
-                    "detail": detail,
-                    "evidence_path": evidence_path,
-                    "excerpt": _evidence_excerpt(outcome["evidence"]),
-                }
+        if only_checks and round_number == 1:
+            plan = agent.manual_plan(only_checks, cfg, remaining)
+        else:
+            stage(f"planning round {round_number}")
+            plan = agent.plan_checks(recon, cfg, remaining, results_so_far, round_number)
+
+        approved, blocked, over_limit = _approve_plan(plan["checks"], remaining, profile, cfg, checks_run)
+        skipped += plan["skipped"] + over_limit
+
+        for item in blocked:
+            # a check whose prerequisites were never observed gets an honest not_applicable row
+            entry = CATALOGUE_BY_ID[item["id"]]
+            remaining.remove(item["id"])
+            stage(f"skipping {item['id']}: prerequisites not met")
+            db.add_check_result(
+                cfg["db_path"], run_id,
+                check_id=item["id"],
+                name=entry["name"],
+                severity=entry["severity"],
+                result="not_applicable",
+                detail=item["reason"],
+                reason="prerequisites not met",
+                round_number=round_number,
             )
+            results_so_far.append({"id": item["id"], "result": "not_applicable", "detail": item["reason"]})
+
+        if not approved:
+            if on_progress:
+                on_progress("nothing left that can run against this target")
+            break
+
+        rounds.append(
+            {
+                "round": round_number,
+                "source": plan["source"],
+                "note": plan.get("note", ""),
+                "done": plan["done"],
+                "checks": [{"id": item["id"], "reason": item["reason"]} for item in approved],
+            }
+        )
+        db.set_run_plan(cfg["db_path"], run_id, _report_plan(rounds, skipped))
+        if on_progress:
+            on_progress(f"round {round_number}: {len(approved)} check(s) from {plan['source']}")
+
+        total = len(approved)
+        for index, item in enumerate(approved, start=1):
+            entry = CATALOGUE_BY_ID[item["id"]]
+            remaining.remove(item["id"])
+            checks_run += 1
+            stage(f"running {item['id']} ({index} of {total})")
+            requests_before = scope.requests_sent
+            try:
+                outcome = checks.CHECKS[item["id"]](scope, cfg)
+            except ScopeError as exc:
+                outcome = {"result": "error", "detail": str(exc), "evidence": {"note": "the check did not complete"}}
+            except requests.exceptions.SSLError as exc:
+                outcome = {
+                    "result": "error",
+                    "detail": f"TLS certificate verification failed, so this check could not run: {exc}",
+                    "evidence": {"note": "the request was refused by the local tls trust settings"},
+                }
+            except requests.exceptions.ConnectionError as exc:
+                outcome = {
+                    "result": "error",
+                    "detail": f"the connection failed, so this check could not run: {exc}",
+                    "evidence": {"note": "the target could not be reached"},
+                }
+            except requests.exceptions.Timeout as exc:
+                # after ConnectionError, because ConnectTimeout is both
+                outcome = {
+                    "result": "error",
+                    "detail": f"the request timed out after {cfg['request_timeout']}s, so this check could not run: {exc}",
+                    "evidence": {"note": "the target did not answer in time"},
+                }
+            except Exception as exc:
+                # one broken check should not throw away the results of the others
+                outcome = {
+                    "result": "error",
+                    "detail": f"{type(exc).__name__}: {exc}",
+                    "evidence": {"traceback": traceback.format_exc()},
+                }
+            requests_used = scope.requests_sent - requests_before
+
+            payload = {"target": scope.origin, "check": item["id"], "reason": item["reason"], **outcome["evidence"]}
+            evidence_path = _write_evidence(evidence_dir, item["id"], payload)
+            result = outcome["result"]
+            detail = outcome["detail"]
+            if result in FINDING_RESULTS and evidence_path is None:
+                # no evidence on disk means no finding, the run can only record that it failed to record
+                result = "error"
+                detail = f"{detail} (the evidence file could not be written, so no finding was created)"
+
+            db.add_check_result(
+                cfg["db_path"], run_id,
+                check_id=item["id"],
+                name=entry["name"],
+                severity=entry["severity"],
+                result=result,
+                detail=detail,
+                reason=item["reason"],
+                evidence_path=evidence_path,
+                requests_used=requests_used,
+                round_number=round_number,
+            )
+            results_so_far.append({"id": item["id"], "result": result, "detail": detail[:160]})
+            if result in FINDING_RESULTS:
+                candidates.append(
+                    {
+                        "check_id": item["id"],
+                        "entry": entry,
+                        "result": result,
+                        "detail": detail,
+                        "evidence_path": evidence_path,
+                        "excerpt": _evidence_excerpt(outcome["evidence"]),
+                    }
+                )
+
+        if plan["done"]:
+            if on_progress and plan.get("note"):
+                on_progress(f"stopping: {plan['note']}")
+            break
+
+    skipped += [{"id": check_id, "reason": "never planned"} for check_id in remaining]
 
     if candidates:
         stage(f"writing up {len(candidates)} finding(s)")
@@ -214,6 +295,9 @@ def _run_checks(run_id, target, cfg, only_checks, on_progress=None):
     findings = db.get_findings(cfg["db_path"], run_id)
     summary = agent.summarise(scope.origin, results, len(findings), cfg)
 
+    final_plan = _report_plan(rounds, skipped)
+    db.set_run_plan(cfg["db_path"], run_id, final_plan)
+
     if on_progress:
         on_progress("writing the report")
     db.finish_run(
@@ -223,8 +307,22 @@ def _run_checks(run_id, target, cfg, only_checks, on_progress=None):
         summary_source="model" if summary["model_generated"] else "runner",
         request_count=scope.requests_sent,
     )
-    _save_report(run_id, plan, results, findings, cfg)
+    _save_report(run_id, final_plan, results, findings, cfg)
     return run_id
+
+
+def _report_plan(rounds, skipped):
+    """the plan as the report needs it: what was asked for, in which round, and what was not run."""
+    return {
+        "source": rounds[0]["source"] if rounds else "none",
+        "rounds": [{"round": item["round"], "note": item["note"], "done": item["done"]} for item in rounds],
+        "checks": [
+            {"id": check["id"], "reason": check["reason"], "round": item["round"]}
+            for item in rounds
+            for check in item["checks"]
+        ],
+        "skipped": skipped,
+    }
 
 
 def _save_report(run_id, plan, results, findings, cfg):

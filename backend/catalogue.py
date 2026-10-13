@@ -8,6 +8,11 @@
 # a check returns failed when the response directly demonstrates the condition it describes,
 # and needs_review when the response is only consistent with it. the descriptions below say
 # which of the two each check can produce, so the difference is visible before a run starts.
+#
+# "requires" names a fact that has to be observed on the target before the check can run.
+# the gate for that lives in unmet_requirement below, and the facts come from recon.py, so a
+# check is never run against a request format it does not support. saying nothing means the
+# check works on any target.
 
 CATALOGUE = [
     {
@@ -88,6 +93,7 @@ CATALOGUE = [
         "name": "sql injection in the login endpoint",
         "category": "injection",
         "severity": "high",
+        "requires": "login_json",
         "description": "sends a normal failed login as a baseline and then the email payload ' OR 1=1-- and compares "
                        "the two responses",
         "fix": "use parameterised queries for the login lookup instead of building sql from the submitted values",
@@ -97,6 +103,7 @@ CATALOGUE = [
         "name": "reflected input in the search parameter",
         "category": "injection",
         "severity": "high",
+        "requires": "search_endpoint",
         "description": "sends a harmless marker plus a script tag to the search parameter and checks whether the tags "
                        "come back unencoded in an html response. reflection in a json response is recorded as an "
                        "encoding problem, because a browser does not run it",
@@ -116,6 +123,7 @@ CATALOGUE = [
         "name": "public demo credentials accepted",
         "category": "authentication",
         "severity": "high",
+        "requires": "login_json",
         "description": "tries a short list of well known demo account passwords against the login endpoint",
         "fix": "change the default accounts and remove the demo users from anything that is not a training lab",
     },
@@ -124,6 +132,7 @@ CATALOGUE = [
         "name": "no throttling on login attempts",
         "category": "authentication",
         "severity": "low",
+        "requires": "login_json",
         "description": "sends 10 quick failed logins and reports throttling when it shows up as a 429, a lockout or "
                        "clearly slower answers. ten requests cannot show that throttling is absent, so a quiet run "
                        "is only an observation",
@@ -138,6 +147,35 @@ SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2, "info": 3}
 
 def get_entry(check_id):
     return CATALOGUE_BY_ID.get(check_id)
+
+
+def unmet_requirement(entry, profile):
+    """why this check cannot run against the observed target, or None when it can.
+
+    this is the deterministic gate. the model may ask for any catalogue id, but a check whose
+    request format does not match what was observed is refused here rather than run and
+    reported as a pass.
+    """
+    need = entry.get("requires")
+    if not need:
+        return None
+
+    if need == "login_json":
+        shape = profile.get("login_shape")
+        if shape == "json":
+            return None
+        if shape == "html_form":
+            return ("the login page is an html form and the login checks only speak the json login "
+                    "api, so this was not run")
+        return f"no json login endpoint was observed (login shape: {shape})"
+
+    if need == "search_endpoint":
+        search = profile.get("search_endpoint") or {}
+        if search.get("present"):
+            return None
+        return f"no search endpoint answered at {search.get('path')} (status {search.get('status')})"
+
+    return f"unknown requirement '{need}', so the check was not run"
 
 
 def catalogue_ids():

@@ -110,6 +110,12 @@ def looks_authenticated(response):
     return any(key in body for key in ("token", "authenticated", "access_token", "sessionid"))
 
 
+def search_url(cfg, value):
+    path = cfg["search_path"]
+    separator = "&q=" if "?" in path else "?q="
+    return f"{path}{separator}{quote(value, safe='')}"
+
+
 def check_security_headers(scope, cfg):
     response = scope.get("/")
     headers = lower_headers(response)
@@ -407,9 +413,7 @@ def check_sql_injection_login(scope, cfg):
 
 
 def check_reflected_xss(scope, cfg):
-    path = cfg["search_path"]
-    separator = "&q=" if "?" in path else "?q="
-    response = scope.get(f"{path}{separator}{quote(XSS_PAYLOAD, safe='')}")
+    response = scope.get(search_url(cfg, XSS_PAYLOAD))
     body = response.text
     content_type = response.headers.get("Content-Type", "")
     is_html = "html" in content_type.lower()

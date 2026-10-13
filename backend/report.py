@@ -16,11 +16,68 @@ def _plan_section(plan):
     if not plan["checks"]:
         lines.append("no checks were planned for this run")
         return lines
-    lines += ["| check | why the agent picked it |", "|---|---|"]
-    for item in plan["checks"]:
-        lines.append(f"| `{item['id']}` | {_cell(item['reason'])} |")
+    rounds = plan.get("rounds") or []
+    if len(rounds) > 1:
+        lines += ["| round | check | why the agent picked it |", "|---|---|---|"]
+        for item in plan["checks"]:
+            lines.append(f"| {item.get('round', 1)} | `{item['id']}` | {_cell(item['reason'])} |")
+    else:
+        lines += ["| check | why the agent picked it |", "|---|---|"]
+        for item in plan["checks"]:
+            lines.append(f"| `{item['id']}` | {_cell(item['reason'])} |")
+    for entry in rounds:
+        if entry.get("note"):
+            lines += ["", f"round {entry['round']} note: {_cell(entry['note'])}"]
     if plan.get("skipped"):
         lines += ["", "skipped: " + ", ".join(f"`{item['id']}` ({item['reason']})" for item in plan["skipped"])]
+    return lines
+
+
+def _profile_section(run):
+    """what the runner observed before planning, which is exactly what the planner was shown."""
+    try:
+        profile = json.loads(run["profile_json"])
+    except (TypeError, ValueError, KeyError):
+        profile = {}
+    if not profile:
+        return []
+    probe = profile.get("login_probe") or {}
+    search = profile.get("search_endpoint") or {}
+    untrusted = profile.get("untrusted") or {}
+    rows = [
+        ("application shape", profile.get("application_shape")),
+        ("login shape", profile.get("login_shape")),
+        ("root status and type", f"{profile.get('root_status')} {profile.get('root_content_type', '')}".strip()),
+        ("unknown path status", profile.get("unknown_path_status")),
+        ("unknown paths return the app page", profile.get("unknown_path_returns_app_shell")),
+        ("allow header", profile.get("allow_header")),
+        (
+            "login form found",
+            json.dumps(profile["login_form"]) if profile.get("login_form") else "none found",
+        ),
+        (
+            "login endpoint probed",
+            f"{probe.get('path')} ({probe.get('source')}) answered {probe.get('status')}, "
+            f"json: {probe.get('json_response')}"
+            if probe
+            else "not probed",
+        ),
+        ("search endpoint", f"{search.get('path')} answered {search.get('status')}"),
+    ]
+    lines = ["## what was observed", "", "| fact | value |", "|---|---|"]
+    for label, value in rows:
+        if value not in (None, ""):
+            lines.append(f"| {label} | {_cell(value)} |")
+    for label, value in untrusted.items():
+        if value:
+            lines.append(f"| untrusted {label} (from the target) | {_cell(value)} |")
+    lines += [
+        "",
+        "these facts were collected by the runner and are the only thing the planner was shown about the "
+        "target. no page html or body text is sent. values marked untrusted come from the target and are "
+        "treated as data, never as instructions.",
+        "",
+    ]
     return lines
 
 
@@ -111,6 +168,7 @@ def render_report(run, plan, results, findings):
     lines += [""] + _results_section(results)
     lines += [""] + _findings_section(findings)
     lines += [""] + _untested_section(results, plan)
+    lines += [""] + _profile_section(run)
     lines += [
         "",
         "---",
