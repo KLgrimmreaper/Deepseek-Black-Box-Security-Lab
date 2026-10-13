@@ -214,32 +214,16 @@ the checks are tested for both false negatives and false positives without needi
 
 verified:
 
-- 20 pytest tests pass (`20 passed in 5.87s`), covering the checks in both fake target modes, the scope rules, the request budget, the evidence-before-finding rule, the stats queries and report generation
-- a full run against a live local http server, from the cli and again through the http api: 13 checks, 52 requests, 3 findings, evidence files and `reports/run_2.md` written, the evidence and report endpoints both answering, and `/api/runs/2/evidence/made_up_check` refused because it is not a catalogue id
-- the dashboard typechecks, builds, and its five pages were each loaded in a browser against real data from two runs, which is where the screenshots in this readme come from
+- 20 pytest tests pass (`20 passed in 5.59s`), covering the checks in both fake target modes, the scope rules, the request budget, the evidence-before-finding rule, the stats queries and report generation
+- a full run against OWASP Juice Shop in docker, twice: once with the fallback plan (48 requests, 8 findings) and once with the real model (12 checks planned by deepseek, 47 requests, 8 findings, `reports/run_3.md`)
+- the real deepseek call works end to end: the model planned 12 of the 13 checks with a reason each, wrote the impact and remediation for all 8 findings, and wrote the summary. every one of those texts is labelled as model written in the report and the dashboard
+- the headline finding was checked by hand, not just trusted: a normal bad login returned `401` with 26 bytes of html, and `' OR 1=1--` returned `200` with 799 bytes of json reading `{"authentication":{"token":"[redacted]","bid":1,"umail":"admin@juice-sh.op"}}`, so the injection logs in as the first admin user
+- the dashboard typechecks, builds, and its five pages were each loaded in a browser against real data from those runs, which is where the screenshots in this readme come from
 
-not verified yet, because the docker daemon was not running and no key was configured while i
-built this:
+not verified:
 
-- a real run against OWASP Juice Shop. the request flow is identical to the http server run above, but i have not watched it against juice shop, so i am not claiming the check results for it
-- a real deepseek api call. `--mock` and `--only` were used for every run so far, so the model planning and the explanations have not run against the real api yet
-
-to close both gaps, start docker desktop and run:
-
-```powershell
-docker compose -f lab/docker-compose.yml up -d
-.\.venv\Scripts\python.exe -m backend.cli run --target http://localhost:3000 --notes "juice shop, real model"
-```
-
-one thing to know about the checked in state: `data/`, `evidence/` and `reports/` currently hold the
-two smoke runs from building the dashboard. they were made against a throwaway
-`python -m http.server` serving this project folder, which is why they report `/.env` as reachable
-(the file really is there). they are gitignored, and deleting all three folders gives you a clean
-start:
-
-```powershell
-Remove-Item -Recurse -Force data, evidence, reports
-```
+- a hardened real target. the only clean target the checks have run against is the fake one in the tests, so the pass branches are tested but not against a real hardened app
+- nothing browser based is tested at all, because there is no browser in the pipeline
 
 ## known limitations
 
@@ -251,6 +235,7 @@ Remove-Item -Recurse -Force data, evidence, reports
 - the run executes in a thread inside the api process, so stopping the api kills a run in progress
 - starting two runs at the same time works (each has its own budget) but both hit the same target
 - the model summary can be vague or wrong. that is exactly why the result column never comes from the model
+- the reasons in the plan table are model commentary, not evidence. against juice shop the model wrote things like "juice shop is famous for accepting well-known demo credentials", which is prior knowledge of a well known target rather than something the recon showed. treat the plan as the agent explaining itself, not as a finding
 - `LAB_CREDENTIALS` defaults to public juice shop demo logins, so `weak_credentials` is not meaningful against a different target unless you change that list
 
 ## not built yet
