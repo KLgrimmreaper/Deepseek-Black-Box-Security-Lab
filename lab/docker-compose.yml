@@ -1,0 +1,8 @@
+services:
+  juice-shop:
+    # pinned so a run today is comparable with a run next week
+    image: bkimminich/juice-shop:v19.0.0
+    container_name: dsh-juice-shop
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
