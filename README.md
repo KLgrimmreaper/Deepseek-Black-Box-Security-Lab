@@ -26,6 +26,29 @@ the model does not do these things:
 so the results table is evidence and the summary paragraph is commentary. the report and the
 dashboard both label which is which.
 
+## the dashboard
+
+![the overview page](docs/dashboard-overview.png)
+
+five pages, each one showing something the backend actually stored:
+
+| page | what is on it |
+|---|---|
+| overview | run, check, finding and request totals, findings by severity, findings per run, the checks that failed most, and the spread of results |
+| runs | start a run, the run list with live progress, and the detail for one run with tabs for results, plan, findings and the markdown report |
+| check catalogue | all 13 checks with their severity, what they send, and the fallback fix text |
+| findings | every finding from every run, filterable by severity, with the impact, remediation and raw evidence |
+| settings | the values the backend loaded, and where data, evidence and reports are written |
+
+the overview and the finding cards are built from real runs only, nothing is seeded. the screenshot
+above is two smoke runs against a throwaway local http server on purpose, so the numbers are small.
+
+each page has a url, so it can be linked to directly: `#overview`, `#runs`, `#catalogue`,
+`#findings`, `#settings`.
+
+![the findings page](docs/dashboard-findings.png)
+
+
 ## how a run works
 
 ```
@@ -163,9 +186,19 @@ cd frontend
 npm.cmd run build
 ```
 
-the dashboard shows the allowed targets, whether a key is loaded, the run list with live progress,
-the plan with the model's reasons, a results table, the findings with their evidence, and the
-markdown report for the run.
+the api the dashboard talks to:
+
+| endpoint | what it returns |
+|---|---|
+| `GET /api/health` | the settings the backend loaded, whether a key is present, and the allowlist |
+| `GET /api/checks` | the check catalogue |
+| `GET /api/stats` | the totals and series the overview page draws |
+| `GET /api/findings` | every finding across all runs, newest first |
+| `POST /api/runs` | start a run (the body is the target and notes) |
+| `GET /api/runs` | the run list with finding counts |
+| `GET /api/runs/{id}` | one run with its plan, results and findings |
+| `GET /api/runs/{id}/report` | the markdown report |
+| `GET /api/runs/{id}/evidence/{check_id}` | the raw evidence json, only for catalogue check ids |
 
 tests:
 
@@ -181,9 +214,9 @@ the checks are tested for both false negatives and false positives without needi
 
 verified:
 
-- 18 pytest tests pass (`18 passed in 5.00s`), covering the checks in both fake target modes, the scope rules, the request budget, the evidence-before-finding rule, and report generation
-- a full run against a live local http server, from the cli and again through the http api: 13 checks, 52 requests, 3 findings, evidence files and `reports/run_2.md` written, the evidence and report endpoints both answering
-- the dashboard typechecks (`tsc --noEmit`) and builds, and the built version is served by the backend on port 8000
+- 20 pytest tests pass (`20 passed in 5.87s`), covering the checks in both fake target modes, the scope rules, the request budget, the evidence-before-finding rule, the stats queries and report generation
+- a full run against a live local http server, from the cli and again through the http api: 13 checks, 52 requests, 3 findings, evidence files and `reports/run_2.md` written, the evidence and report endpoints both answering, and `/api/runs/2/evidence/made_up_check` refused because it is not a catalogue id
+- the dashboard typechecks, builds, and its five pages were each loaded in a browser against real data from two runs, which is where the screenshots in this readme come from
 
 not verified yet, because the docker daemon was not running and no key was configured while i
 built this:
@@ -196,6 +229,16 @@ to close both gaps, start docker desktop and run:
 ```powershell
 docker compose -f lab/docker-compose.yml up -d
 .\.venv\Scripts\python.exe -m backend.cli run --target http://localhost:3000 --notes "juice shop, real model"
+```
+
+one thing to know about the checked in state: `data/`, `evidence/` and `reports/` currently hold the
+two smoke runs from building the dashboard. they were made against a throwaway
+`python -m http.server` serving this project folder, which is why they report `/.env` as reachable
+(the file really is there). they are gitignored, and deleting all three folders gives you a clean
+start:
+
+```powershell
+Remove-Item -Recurse -Force data, evidence, reports
 ```
 
 ## known limitations
@@ -233,7 +276,12 @@ backend/
   report.py      markdown report
   tests/         pytest, with the fake target
 frontend/        react + typescript + vite dashboard
+  src/api.ts     the fetch calls the pages use
+  src/theme.ts   severity and result colours and ordering
+  src/components/ Sidebar, Dashboard, RunsView, RunDetail, Catalogue, FindingsView, SettingsView, charts
+  src/components/charts.tsx  the stat card, donut, area chart and bar list, plain svg, no chart library
 lab/             docker compose for juice shop
+docs/            the dashboard screenshots used in this readme
 data/            sqlite file (gitignored)
 evidence/        raw requests and responses per run (gitignored)
 reports/         markdown report per run (gitignored)
