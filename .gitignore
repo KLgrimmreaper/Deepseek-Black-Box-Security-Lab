@@ -1,0 +1,28 @@
+# ai and planning artifacts, kept out of the repo on purpose
+PLAN.md
+AGENTS.md
+CLAUDE.md
+.cursor/
+.ai/
+*.ai-notes.md
+
+# secrets
+.env
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+
+# node
+node_modules/
+dist/
+.vite/
+
+# generated lab data
+data/
+evidence/
+reports/
