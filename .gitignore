@@ -26,3 +26,7 @@ dist/
 data/
 evidence/
 reports/
+
+# local run output
+server.log
+*.log
